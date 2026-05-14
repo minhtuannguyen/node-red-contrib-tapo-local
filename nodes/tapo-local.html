@@ -1,0 +1,104 @@
+<!-- ── tapo-device config node ───────────────────────────────────────────── -->
+<script type="text/javascript">
+    RED.nodes.registerType('tapo-device', {
+        category:    'config',
+        defaults: {
+            name:     { value: '' },
+            ip:       { value: '', required: true },
+            username: { value: 'admin', required: true },
+        },
+        credentials: {
+            password: { type: 'password' },
+        },
+        label: function () { return this.name || this.ip || 'Tapo Device'; },
+    });
+</script>
+
+<script type="text/html" data-template-name="tapo-device">
+    <div class="form-row">
+        <label for="node-config-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-config-input-name" placeholder="optional label">
+    </div>
+    <div class="form-row">
+        <label for="node-config-input-ip"><i class="fa fa-globe"></i> IP</label>
+        <input type="text" id="node-config-input-ip" placeholder="192.168.1.100">
+    </div>
+    <div class="form-row">
+        <label for="node-config-input-username"><i class="fa fa-user"></i> Username</label>
+        <input type="text" id="node-config-input-username" placeholder="admin">
+    </div>
+    <div class="form-row">
+        <label for="node-config-input-password"><i class="fa fa-lock"></i> Password</label>
+        <input type="password" id="node-config-input-password">
+    </div>
+</script>
+
+<script type="text/html" data-help-name="tapo-device">
+    <p>Configuration for a Tapo C225 camera.</p>
+    <p>Use the camera account password from <b>Tapo app → Settings → Advanced → Camera Account</b>.
+    This may differ from your TP-Link cloud password.</p>
+</script>
+
+
+<!-- ── tapo-c225 command node ───────────────────────────────────────────── -->
+<script type="text/javascript">
+    RED.nodes.registerType('tapo-local', {
+        category: 'function',
+        color:    '#5bb8f5',
+        defaults: {
+            name:    { value: '' },
+            device:  { value: '', type: 'tapo-device', required: true },
+            command: { value: 'privacy-on' },
+        },
+        inputs:  1,
+        outputs: 1,
+        icon:    'camera.png',
+        label:      function () { return this.name || this.command || 'Tapo Local'; },
+        labelStyle: function () { return this.name ? 'node_label_italic' : ''; },
+    });
+</script>
+
+<script type="text/html" data-template-name="tapo-local">
+    <div class="form-row">
+        <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-input-name" placeholder="optional">
+    </div>
+    <div class="form-row">
+        <label for="node-input-device"><i class="fa fa-video-camera"></i> Device</label>
+        <input type="text" id="node-input-device">
+    </div>
+    <div class="form-row">
+        <label for="node-input-command"><i class="fa fa-cog"></i> Command</label>
+        <select id="node-input-command" style="width:70%">
+            <option value="privacy-on">Privacy ON (lens covered)</option>
+            <option value="privacy-off">Privacy OFF (lens open)</option>
+            <option value="reboot">Reboot</option>
+        </select>
+    </div>
+    <div class="form-tips">
+        Override at runtime: set <code>msg.command</code> to
+        <code>privacy-on</code>, <code>privacy-off</code>, or <code>reboot</code>.
+    </div>
+</script>
+
+<script type="text/html" data-help-name="tapo-local">
+    <p>Controls a Tapo C225 camera via its local HTTPS API — no cloud required.</p>
+
+    <h3>Input</h3>
+    <p>Any message triggers the configured command.
+    Set <code>msg.command</code> to override the node setting at runtime.</p>
+
+    <h3>Commands</h3>
+    <ul>
+        <li><code>privacy-on</code> — cover the lens (privacy mode enabled)</li>
+        <li><code>privacy-off</code> — uncover the lens</li>
+        <li><code>reboot</code> — reboot the camera</li>
+    </ul>
+
+    <h3>Output</h3>
+    <p><code>msg.payload</code> &mdash; <code>{ command, result }</code></p>
+
+    <h3>Notes</h3>
+    <p>Tested with <b>Tapo C225</b> firmware 1.2.x.
+    Each command opens a fresh auth session (challenge-response, no cloud).</p>
+</script>
