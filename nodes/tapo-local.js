@@ -1,6 +1,6 @@
 'use strict';
 
-const { authenticate, COMMANDS } = require('../lib/tapo-client');
+const { executeOnDevice, COMMANDS } = require('../lib/tapo-client');
 
 module.exports = function (RED) {
 
@@ -37,12 +37,12 @@ module.exports = function (RED) {
 
             node.status({ fill: 'blue', shape: 'dot', text: commandKey });
             try {
-                const { sendCmd } = await authenticate(
+                const result = await executeOnDevice(
                     deviceNode.ip,
                     deviceNode.username,
                     deviceNode.credentials.password,
+                    apiCmd,
                 );
-                const result = await sendCmd(apiCmd);
                 msg.payload  = { command: commandKey, result };
                 node.status({ fill: 'green', shape: 'dot', text: `✓ ${commandKey}` });
                 send(msg);
