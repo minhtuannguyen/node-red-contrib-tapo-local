@@ -72,12 +72,14 @@
         <select id="node-input-command" style="width:70%">
             <option value="privacy-on">Privacy ON (lens covered)</option>
             <option value="privacy-off">Privacy OFF (lens open)</option>
+            <option value="alarm-on">Alarm ON</option>
+            <option value="alarm-off">Alarm OFF</option>
             <option value="reboot">Reboot</option>
         </select>
     </div>
     <div class="form-tips">
         Override at runtime: set <code>msg.command</code> to
-        <code>privacy-on</code>, <code>privacy-off</code>, or <code>reboot</code>.
+        <code>privacy-on</code>, <code>privacy-off</code>, <code>alarm-on</code>, <code>alarm-off</code>, or <code>reboot</code>.
     </div>
 </script>
 
@@ -92,6 +94,8 @@
     <ul>
         <li><code>privacy-on</code> — cover the lens (privacy mode enabled)</li>
         <li><code>privacy-off</code> — uncover the lens</li>
+        <li><code>alarm-on</code> — enable the motion alert alarm (sound + light)</li>
+        <li><code>alarm-off</code> — disable the motion alert alarm</li>
         <li><code>reboot</code> — reboot the camera</li>
     </ul>
 

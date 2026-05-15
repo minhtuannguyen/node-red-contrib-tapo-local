@@ -13,6 +13,9 @@ const crypto = require('crypto');
 const COMMANDS = {
     'privacy-on':  { method: 'setLensMaskConfig', params: { lens_mask: { lens_mask_info: { enabled: 'on'  } } } },
     'privacy-off': { method: 'setLensMaskConfig', params: { lens_mask: { lens_mask_info: { enabled: 'off' } } } },
+    // _direct: pytapo sends alarm via method:'set' directly (not wrapped in multipleRequest)
+    'alarm-on':   { _direct: true, method: 'set', msg_alarm: { chn1_msg_alarm_info: { alarm_type: '0', enabled: 'on',  light_type: '0', alarm_mode: ['sound', 'light'] } } },
+    'alarm-off':  { _direct: true, method: 'set', msg_alarm: { chn1_msg_alarm_info: { alarm_type: '0', enabled: 'off', light_type: '0', alarm_mode: ['sound', 'light'] } } },
     // params from pytapo: method=rebootDevice, params={system:{reboot:'null'}} (string 'null', not JSON null)
     'reboot':      { method: 'rebootDevice', params: { system: { reboot: 'null' } }, _acceptNetworkErrors: true },
 };
@@ -103,12 +106,12 @@ async function main() {
     const ivb       = tok16('ivb');
 
     // ── 5. Encrypt and send command via securePassthrough ──────────────────────
-    // Camera requires multipleRequest wrapper around every command.
-    // Body must use Python json.dumps separators (': ' and ', ') for Tapo_tag validation.
-    const { _acceptErrors = [], _acceptNetworkErrors = false, ...apiCmd } = COMMANDS[command];
-    const wrapped = { method: 'multipleRequest', params: { requests: [apiCmd] } };
+    // _direct commands (e.g. alarm) use method:'set'/'do' sent as-is (pytapo's performRequest path).
+    // All other commands are wrapped in multipleRequest (pytapo's executeFunction path).
+    const { _acceptErrors = [], _acceptNetworkErrors = false, _direct = false, ...apiCmd } = COMMANDS[command];
+    const payload = _direct ? apiCmd : { method: 'multipleRequest', params: { requests: [apiCmd] } };
     const cipher  = crypto.createCipheriv('aes-128-cbc', lsk, ivb);
-    const encReq  = Buffer.concat([cipher.update(JSON.stringify(wrapped), 'utf8'), cipher.final()]).toString('base64');
+    const encReq  = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]).toString('base64');
     const bodyStr = JSON.stringify({ method: 'securePassthrough', params: { request: encReq } })
         .replace(/:/g, ': ').replace(/,/g, ', ');
     const tag = crypto.createHash('sha256')
@@ -136,14 +139,23 @@ async function main() {
     }
 
     if (r3.error_code !== 0) throw new Error('securePassthrough failed: ' + JSON.stringify(r3));
+    // Direct commands (method:'set'/'do') return {error_code:0} with no encrypted body
+    if (!r3.result?.response) { console.log(`OK: ${command}`); return; }
     const decipher = crypto.createDecipheriv('aes-128-cbc', lsk, ivb);
     const inner    = JSON.parse(
         Buffer.concat([decipher.update(Buffer.from(r3.result.response, 'base64')), decipher.final()]).toString()
     );
-    if (inner.error_code !== 0) throw new Error('command failed: ' + JSON.stringify(inner));
-    const resp0 = inner.result?.responses?.[0];
-    if (resp0?.error_code !== 0 && !_acceptErrors.includes(resp0?.error_code)) {
-        throw new Error('command error: ' + JSON.stringify(resp0));
+    if (_direct) {
+        // Direct commands return {error_code, result} — no responses array
+        if (inner.error_code !== 0 && !_acceptErrors.includes(inner.error_code)) {
+            throw new Error('command error: ' + JSON.stringify(inner));
+        }
+    } else {
+        if (inner.error_code !== 0) throw new Error('command failed: ' + JSON.stringify(inner));
+        const resp0 = inner.result?.responses?.[0];
+        if (resp0?.error_code !== 0 && !_acceptErrors.includes(resp0?.error_code)) {
+            throw new Error('command error: ' + JSON.stringify(resp0));
+        }
     }
 
     console.log(`OK: ${command}`);
