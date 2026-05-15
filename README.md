@@ -42,28 +42,74 @@ Sends a command to the camera when triggered by any input message.
 
 | `msg.command` | Description |
 |---|---|
+| **Privacy** | |
 | `privacy-on` | Cover the lens (privacy mode on) |
 | `privacy-off` | Uncover the lens |
+| **Alarm** | |
 | `alarm-on` | Enable alarm on detected events (sound + light) |
 | `alarm-off` | Disable alarm on detected events |
 | `alarm-trigger` | Immediately sound siren + light (manual trigger) |
 | `alarm-stop` | Stop a manually triggered alarm |
+| **Motion & AI detection** | |
 | `motion-on` | Enable motion detection |
 | `motion-off` | Disable motion detection |
 | `person-on` | Enable AI person detection |
 | `person-off` | Disable AI person detection |
+| `pet-on` | Enable pet detection |
+| `pet-off` | Disable pet detection |
+| `vehicle-on` | Enable vehicle detection |
+| `vehicle-off` | Disable vehicle detection |
+| `linecross-on` | Enable line crossing detection |
+| `linecross-off` | Disable line crossing detection |
+| `tamper-on` | Enable camera tamper detection |
+| `tamper-off` | Disable camera tamper detection |
+| `tracking-on` | Enable auto-tracking (pan/tilt follows subject) |
+| `tracking-off` | Disable auto-tracking |
+| **Sound detection** | |
+| `baby-cry-on` | Enable baby cry detection |
+| `baby-cry-off` | Disable baby cry detection |
+| `glass-break-on` | Enable glass break detection |
+| `glass-break-off` | Disable glass break detection |
+| `bark-on` | Enable dog bark detection |
+| `bark-off` | Disable dog bark detection |
+| `meow-on` | Enable cat meow detection |
+| `meow-off` | Disable cat meow detection |
+| **Camera** | |
 | `led-on` | Turn the status LED on |
 | `led-off` | Turn the status LED off |
 | `night-vision-on` | Night vision always-on (IR active) |
 | `night-vision-off` | Night vision off (always day mode) |
 | `night-vision-auto` | Night vision auto-switch |
+| **System** | |
 | `reboot` | Reboot the camera |
+| **Monitor** | |
+| `get-detections` | Poll recent detection events — see below |
 
 **Output `msg.payload`:**
 
 ```json
 { "command": "privacy-on", "result": {} }
 ```
+
+---
+
+### Polling detection events (`get-detections`)
+
+Set `msg.command = 'get-detections'` and optionally `msg.minutes = 10` (default 5) before triggering the node.
+`msg.payload.events` will be an array of detection objects from the camera's local event log:
+
+```json
+{ "command": "get-detections", "events": [
+  { "start_time": 1747300000, "end_time": 1747300010, "cls_type": "person", ... },
+  { "start_time": 1747299900, "end_time": 1747299905, "cls_type": "baby_cry", ... }
+]}
+```
+
+**Detection types reported by C225:** `motion`, `person`, `vehicle`, `pet`, `baby_cry`, `glass_break`, and others depending on firmware.
+
+> **Requires:** SD card inserted + local recording enabled in the Tapo app. If not present the node returns an empty events array.
+
+**HomeKit Secure Video note:** HSV streams the raw RTSP feed to your Apple TV/HomePod and runs its own AI (person, face, activity zones) entirely on Apple's side. Tapo's on-device AI detections (baby cry, glass break, etc.) are **not** forwarded to HSV — they are separate pipelines. Use `get-detections` with a periodic inject node to bridge Tapo AI events into Node-RED automations.
 
 ---
 

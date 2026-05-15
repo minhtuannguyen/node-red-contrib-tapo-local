@@ -85,6 +85,27 @@
                 <option value="motion-off">Motion detection OFF</option>
                 <option value="person-on">Person detection ON (AI)</option>
                 <option value="person-off">Person detection OFF (AI)</option>
+                <option value="pet-on">Pet detection ON</option>
+                <option value="pet-off">Pet detection OFF</option>
+                <option value="vehicle-on">Vehicle detection ON</option>
+                <option value="vehicle-off">Vehicle detection OFF</option>
+                <option value="baby-cry-on">Baby cry detection ON</option>
+                <option value="baby-cry-off">Baby cry detection OFF</option>
+                <option value="glass-break-on">Glass break detection ON</option>
+                <option value="glass-break-off">Glass break detection OFF</option>
+                <option value="bark-on">Dog bark detection ON</option>
+                <option value="bark-off">Dog bark detection OFF</option>
+                <option value="meow-on">Cat meow detection ON</option>
+                <option value="meow-off">Cat meow detection OFF</option>
+                <option value="linecross-on">Line crossing detection ON</option>
+                <option value="linecross-off">Line crossing detection OFF</option>
+                <option value="tamper-on">Camera tamper detection ON</option>
+                <option value="tamper-off">Camera tamper detection OFF</option>
+                <option value="tracking-on">Auto-tracking ON</option>
+                <option value="tracking-off">Auto-tracking OFF</option>
+            </optgroup>
+            <optgroup label="Monitor">
+                <option value="get-detections">Get recent detections (poll)</option>
             </optgroup>
             <optgroup label="Camera">
                 <option value="led-on">LED ON</option>
@@ -101,6 +122,7 @@
     <div class="form-tips">
         Override at runtime by setting <code>msg.command</code> to any of the values above
         (e.g. <code>privacy-on</code>, <code>alarm-trigger</code>, <code>motion-off</code>, …).
+        For <code>get-detections</code> set <code>msg.minutes</code> (default 5) to control the lookback window.
     </div>
 </script>
 
@@ -116,8 +138,15 @@
         <li><b>Privacy:</b> <code>privacy-on</code> — cover the lens; <code>privacy-off</code> — uncover</li>
         <li><b>Alarm (auto):</b> <code>alarm-on</code> / <code>alarm-off</code> — enable/disable alarm on detected events</li>
         <li><b>Alarm (manual):</b> <code>alarm-trigger</code> — immediately sound siren+light; <code>alarm-stop</code> — stop it</li>
-        <li><b>Motion detection:</b> <code>motion-on</code> / <code>motion-off</code></li>
-        <li><b>Person detection (AI):</b> <code>person-on</code> / <code>person-off</code></li>
+        <li><b>Detection (AI):</b> <code>motion-on/off</code>, <code>person-on/off</code>,
+            <code>pet-on/off</code>, <code>vehicle-on/off</code>,
+            <code>baby-cry-on/off</code>, <code>glass-break-on/off</code>,
+            <code>bark-on/off</code> (dog), <code>meow-on/off</code> (cat),
+            <code>linecross-on/off</code>, <code>tamper-on/off</code>,
+            <code>tracking-on/off</code></li>
+        <li><b>Monitor:</b> <code>get-detections</code> — poll the camera’s event log; returns
+            <code>msg.payload.events[]</code> for the last N minutes (set <code>msg.minutes</code>, default 5).
+            Requires SD card + local recording enabled on the camera.</li>
         <li><b>LED:</b> <code>led-on</code> / <code>led-off</code></li>
         <li><b>Night vision:</b> <code>night-vision-on</code> (always IR) / <code>night-vision-off</code> (always day) / <code>night-vision-auto</code></li>
         <li><b>System:</b> <code>reboot</code></li>

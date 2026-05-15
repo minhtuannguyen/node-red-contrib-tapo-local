@@ -1,6 +1,6 @@
 'use strict';
 
-const { executeOnDevice, COMMANDS } = require('../lib/tapo-client');
+const { executeOnDevice, COMMANDS, getDetections } = require('../lib/tapo-client');
 
 module.exports = function (RED) {
 
@@ -28,10 +28,31 @@ module.exports = function (RED) {
 
         node.on('input', async (msg, send, done) => {
             const commandKey = msg.command ?? config.command;
+
+            // Special: poll recent detection events from the camera's event log
+            if (commandKey === 'get-detections') {
+                const minutes = typeof msg.minutes === 'number' ? msg.minutes : 5;
+                node.status({ fill: 'blue', shape: 'dot', text: 'get-detections' });
+                try {
+                    const events = await getDetections(
+                        deviceNode.ip, deviceNode.username,
+                        deviceNode.credentials.password, minutes,
+                    );
+                    msg.payload = { command: 'get-detections', events };
+                    node.status({ fill: 'green', shape: 'dot', text: `✓ ${events.length} event(s)` });
+                    send(msg);
+                    done();
+                } catch (err) {
+                    node.status({ fill: 'red', shape: 'ring', text: err.message.slice(0, 50) });
+                    done(err);
+                }
+                return;
+            }
+
             const apiCmd     = COMMANDS[commandKey];
 
             if (!apiCmd) {
-                done(new Error(`Unknown command: "${commandKey}". Valid: ${Object.keys(COMMANDS).join(', ')}`));
+                done(new Error(`Unknown command: "${commandKey}". Valid: ${Object.keys(COMMANDS).concat('get-detections').join(', ')}`));
                 return;
             }
 
