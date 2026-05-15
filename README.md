@@ -41,10 +41,23 @@ Sends a command to the camera when triggered by any input message.
 **Available commands:**
 
 | `msg.command` | Description |
-|---------------|-------------|
-| `privacy-on`  | Cover the lens (privacy mode on) |
+|---|---|
+| `privacy-on` | Cover the lens (privacy mode on) |
 | `privacy-off` | Uncover the lens |
-| `reboot`      | Reboot the camera |
+| `alarm-on` | Enable alarm on detected events (sound + light) |
+| `alarm-off` | Disable alarm on detected events |
+| `alarm-trigger` | Immediately sound siren + light (manual trigger) |
+| `alarm-stop` | Stop a manually triggered alarm |
+| `motion-on` | Enable motion detection |
+| `motion-off` | Disable motion detection |
+| `person-on` | Enable AI person detection |
+| `person-off` | Disable AI person detection |
+| `led-on` | Turn the status LED on |
+| `led-off` | Turn the status LED off |
+| `night-vision-on` | Night vision always-on (IR active) |
+| `night-vision-off` | Night vision off (always day mode) |
+| `night-vision-auto` | Night vision auto-switch |
+| `reboot` | Reboot the camera |
 
 **Output `msg.payload`:**
 
@@ -56,15 +69,14 @@ Sends a command to the camera when triggered by any input message.
 
 ## Adding commands
 
-Open `lib/tapo-client.js` and append an entry to `COMMANDS`. No other files need to change except adding the option to the dropdown in `nodes/tapo-c225.html`.
+Open `lib/tapo-client.js` and append an entry to `COMMANDS`. No other file changes needed unless you want the command in the editor dropdown (`nodes/tapo-local.html`).
 
 ```javascript
 const COMMANDS = {
-    'privacy-on':  { method: 'setLensMaskConfig', params: { lens_mask: { lens_mask_info: { enabled: 'on'  } } } },
-    'privacy-off': { method: 'setLensMaskConfig', params: { lens_mask: { lens_mask_info: { enabled: 'off' } } } },
-    'reboot':      { method: 'reboot' },
-    // add here:
-    'my-command':  { method: 'someMethod', params: { ... } },
+    // _direct: false (default) → wrapped in multipleRequest (pytapo executeFunction path)
+    // _direct: true            → sent as-is (pytapo performRequest path, for method:'set'/'do')
+
+    'my-command': { method: 'someMethod', params: { ... } },
 };
 ```
 

@@ -70,16 +70,37 @@
     <div class="form-row">
         <label for="node-input-command"><i class="fa fa-cog"></i> Command</label>
         <select id="node-input-command" style="width:70%">
-            <option value="privacy-on">Privacy ON (lens covered)</option>
-            <option value="privacy-off">Privacy OFF (lens open)</option>
-            <option value="alarm-on">Alarm ON</option>
-            <option value="alarm-off">Alarm OFF</option>
-            <option value="reboot">Reboot</option>
+            <optgroup label="Privacy">
+                <option value="privacy-on">Privacy ON (lens covered)</option>
+                <option value="privacy-off">Privacy OFF (lens open)</option>
+            </optgroup>
+            <optgroup label="Alarm">
+                <option value="alarm-on">Alarm auto-ON (on detection)</option>
+                <option value="alarm-off">Alarm auto-OFF</option>
+                <option value="alarm-trigger">Alarm trigger NOW (siren + light)</option>
+                <option value="alarm-stop">Alarm stop</option>
+            </optgroup>
+            <optgroup label="Detection">
+                <option value="motion-on">Motion detection ON</option>
+                <option value="motion-off">Motion detection OFF</option>
+                <option value="person-on">Person detection ON (AI)</option>
+                <option value="person-off">Person detection OFF (AI)</option>
+            </optgroup>
+            <optgroup label="Camera">
+                <option value="led-on">LED ON</option>
+                <option value="led-off">LED OFF</option>
+                <option value="night-vision-on">Night vision ON (always IR)</option>
+                <option value="night-vision-off">Night vision OFF (always day)</option>
+                <option value="night-vision-auto">Night vision AUTO</option>
+            </optgroup>
+            <optgroup label="System">
+                <option value="reboot">Reboot</option>
+            </optgroup>
         </select>
     </div>
     <div class="form-tips">
-        Override at runtime: set <code>msg.command</code> to
-        <code>privacy-on</code>, <code>privacy-off</code>, <code>alarm-on</code>, <code>alarm-off</code>, or <code>reboot</code>.
+        Override at runtime by setting <code>msg.command</code> to any of the values above
+        (e.g. <code>privacy-on</code>, <code>alarm-trigger</code>, <code>motion-off</code>, …).
     </div>
 </script>
 
@@ -92,11 +113,14 @@
 
     <h3>Commands</h3>
     <ul>
-        <li><code>privacy-on</code> — cover the lens (privacy mode enabled)</li>
-        <li><code>privacy-off</code> — uncover the lens</li>
-        <li><code>alarm-on</code> — enable the motion alert alarm (sound + light)</li>
-        <li><code>alarm-off</code> — disable the motion alert alarm</li>
-        <li><code>reboot</code> — reboot the camera</li>
+        <li><b>Privacy:</b> <code>privacy-on</code> — cover the lens; <code>privacy-off</code> — uncover</li>
+        <li><b>Alarm (auto):</b> <code>alarm-on</code> / <code>alarm-off</code> — enable/disable alarm on detected events</li>
+        <li><b>Alarm (manual):</b> <code>alarm-trigger</code> — immediately sound siren+light; <code>alarm-stop</code> — stop it</li>
+        <li><b>Motion detection:</b> <code>motion-on</code> / <code>motion-off</code></li>
+        <li><b>Person detection (AI):</b> <code>person-on</code> / <code>person-off</code></li>
+        <li><b>LED:</b> <code>led-on</code> / <code>led-off</code></li>
+        <li><b>Night vision:</b> <code>night-vision-on</code> (always IR) / <code>night-vision-off</code> (always day) / <code>night-vision-auto</code></li>
+        <li><b>System:</b> <code>reboot</code></li>
     </ul>
 
     <h3>Output</h3>
@@ -104,5 +128,5 @@
 
     <h3>Notes</h3>
     <p>Tested with <b>Tapo C225</b> firmware 1.2.x.
-    Each command opens a fresh auth session (challenge-response, no cloud).</p>
+    Auth sessions are cached (10 min) and serialised per device — concurrent nodes share one session safely.</p>
 </script>
