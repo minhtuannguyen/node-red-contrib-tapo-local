@@ -1,4 +1,7 @@
 # node-red-contrib-tapo-local
+[![npm](https://img.shields.io/npm/v/@minguyen68/node-red-contrib-tapo-local.svg?style=flat-square)](https://www.npmjs.com/package/@minguyen68/node-red-contrib-tapo-local)
+[![npm](https://img.shields.io/npm/dt/@minguyen68/node-red-contrib-tapo-local.svg?style=flat-square)](https://www.npmjs.com/package/@minguyen68/node-red-contrib-tapo-local)
+[![GitHub last commit](https://img.shields.io/github/last-commit/minhtuannguyen/node-red-contrib-tapo-local.svg?style=flat-square)](https://github.com/minhtuannguyen/node-red-contrib-tapo-local)
 
 Node-RED node for **local** control of Tapo C225 cameras — no cloud required
 
@@ -108,8 +111,6 @@ Set `msg.command = 'get-detections'` and optionally `msg.minutes = 10` (default 
 **Detection types reported by C225:** `motion`, `person`, `vehicle`, `pet`, `baby_cry`, `glass_break`, and others depending on firmware.
 
 > **Requires:** SD card inserted + local recording enabled in the Tapo app. If not present the node returns an empty events array.
-
-**HomeKit Secure Video note:** HSV streams the raw RTSP feed to your Apple TV/HomePod and runs its own AI (person, face, activity zones) entirely on Apple's side. Tapo's on-device AI detections (baby cry, glass break, etc.) are **not** forwarded to HSV — they are separate pipelines. Use `get-detections` with a periodic inject node to bridge Tapo AI events into Node-RED automations.
 
 ---
 
