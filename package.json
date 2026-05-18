@@ -12,7 +12,8 @@
     ],
     "node-red": {
         "nodes": {
-            "tapo-local": "nodes/tapo-local.js"
+            "tapo-local":         "nodes/tapo-local.js",
+            "tapo-onvif-events":  "nodes/tapo-onvif-events.js"
         }
     },
     "author": "",

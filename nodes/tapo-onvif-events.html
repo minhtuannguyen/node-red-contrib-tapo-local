@@ -1,0 +1,142 @@
+<!--
+  tapo-onvif-events — Node-RED node UI
+  Zero-dep ONVIF WS-PullPoint event subscription for Tapo C225.
+-->
+<script type="text/javascript">
+    RED.nodes.registerType('tapo-onvif-events', {
+        category:     'Tapo',
+        color:        '#00b4d8',
+        icon:         'camera.svg',
+        inputs:       1,
+        outputs:      1,
+        paletteLabel: 'tapo onvif events',
+
+        defaults: {
+            name:          { value: '' },
+            device:        { value: '', type: 'tapo-device', required: true },
+            onvifPort:     { value: 2020,  validate: RED.validators.number() },
+            pullTimeout:   { value: 5,     validate: RED.validators.number() },
+            motionTimeout: { value: 30,    validate: RED.validators.number() },
+            action:        { value: '' },
+        },
+
+        label: function () {
+            return this.name || 'tapo onvif events';
+        },
+    });
+</script>
+
+<script type="text/x-red" data-template-name="tapo-onvif-events">
+    <div class="form-row">
+        <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-input-name" placeholder="Name">
+    </div>
+
+    <div class="form-row">
+        <label for="node-input-device"><i class="fa fa-camera"></i> Device</label>
+        <input type="text" id="node-input-device">
+    </div>
+
+    <div class="form-row">
+        <label for="node-input-onvifPort"><i class="fa fa-plug"></i> ONVIF port</label>
+        <input type="number" id="node-input-onvifPort" min="1" max="65535" style="width:90px">
+        <span style="margin-left:6px;color:#888;font-size:0.9em">default 2020 for Tapo cameras</span>
+    </div>
+
+    <div class="form-row">
+        <label for="node-input-action"><i class="fa fa-play"></i> Action</label>
+        <select id="node-input-action" style="width:200px">
+            <option value="">— set via msg.action —</option>
+            <option value="start">Start listening</option>
+            <option value="stop">Stop listening</option>
+        </select>
+    </div>
+
+    <hr style="margin:12px 0">
+
+    <div class="form-row">
+        <label for="node-input-pullTimeout"><i class="fa fa-clock-o"></i> Poll hold</label>
+        <input type="number" id="node-input-pullTimeout" min="1" max="60" style="width:70px"> seconds
+        <div style="font-size:0.82em;color:#888;margin-top:4px;margin-left:110px">
+            How long the camera holds each PullMessages request before returning empty
+            (default 5 s — reduces request frequency without adding latency).
+        </div>
+    </div>
+
+    <div class="form-row">
+        <label for="node-input-motionTimeout"><i class="fa fa-hourglass-half"></i> Motion timeout</label>
+        <input type="number" id="node-input-motionTimeout" min="10" max="300" style="width:70px"> seconds
+        <div style="font-size:0.82em;color:#888;margin-top:4px;margin-left:110px">
+            Time of camera silence before emitting <code>detected:false</code>.
+            Must be longer than the camera's event batch interval (~14 s on C225).
+            Default 30 s is safe. Increase to 45–60 s if you see spurious false events.
+        </div>
+    </div>
+</script>
+
+<script type="text/x-red" data-help-name="tapo-onvif-events">
+    <p>
+        Subscribes to ONVIF events from a Tapo C225 (or compatible) camera using a
+        direct WS-PullPoint implementation — <strong>no <code>onvif</code> npm library</strong>,
+        zero HTTP requests sent to the camera while stopped.
+    </p>
+    <p>
+        Safe to use alongside the <strong>tapo-local</strong> node: sending
+        <code>stop</code> before toggling privacy mode gives the camera time to free
+        its connection slot before the Tapo HTTPS API needs it.
+    </p>
+
+    <h3>Input</h3>
+    <dl class="message-properties">
+        <dt>action <span class="property-type">string</span></dt>
+        <dd>
+            <code>"start"</code> — begin ONVIF pull-point subscription and deliver events.<br>
+            <code>"stop"</code> — send ONVIF Unsubscribe to the camera and halt all requests.
+        </dd>
+    </dl>
+
+    <h3>Output</h3>
+    <dl class="message-properties">
+        <dt>topic <span class="property-type">string</span></dt>
+        <dd>
+            ONVIF event topic with namespace prefixes stripped,
+            e.g. <code>RuleEngine/PeopleDetector/People</code> or
+            <code>RuleEngine/MotionRegionDetector/Motion</code>.
+        </dd>
+        <dt>payload.detected <span class="property-type">boolean</span></dt>
+        <dd>
+            <code>true</code> when motion or person is detected;
+            <code>false</code> when motion stops (watchdog timeout).
+        </dd>
+        <dt>payload.time <span class="property-type">string</span></dt>
+        <dd>UTC timestamp from the camera event.</dd>
+        <dt>payload.property <span class="property-type">string</span></dt>
+        <dd>ONVIF PropertyOperation: <code>Initialized</code>, <code>Changed</code>, or <code>timeout</code> (watchdog).</dd>
+        <dt>payload.source <span class="property-type">object</span></dt>
+        <dd>Source SimpleItem key-value pairs (e.g. <code>{ Rule: "MyMotionRule" }</code>).</dd>
+        <dt>payload.data <span class="property-type">object</span></dt>
+        <dd>Data SimpleItem key-value pairs (e.g. <code>{ IsMotion: "true" }</code>).</dd>
+    </dl>
+
+    <h3>Tapo C225 quirks</h3>
+    <p>
+        The C225 sends continuous <em>Initialized</em> events (not <em>Changed</em>)
+        batched roughly every 14 s while motion is present.  The node coalesces each
+        batch with a 300 ms debounce and resets the watchdog on the first event of
+        each batch to avoid race conditions.
+    </p>
+    <p>
+        Set <strong>Motion timeout</strong> to at least 2× the camera's batch interval.
+        30 s (the default) works well for the C225.
+    </p>
+
+    <h3>Recommended flow for privacy mode</h3>
+    <pre>
+privacy ON  → [stop  → tapo-onvif-events] → [delay 1s] → [privacy-on  → tapo-local]
+privacy OFF → [privacy-off → tapo-local]  → [delay 1s] → [start → tapo-onvif-events]
+    </pre>
+    <p>
+        The 1 s delay between the ONVIF unsubscribe and the Tapo HTTPS command ensures
+        the camera has processed the Unsubscribe before new connections arrive.
+    </p>
+</script>

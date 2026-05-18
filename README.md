@@ -129,6 +129,92 @@ const COMMANDS = {
 
 ---
 
+## `tapo-onvif-events` — live event subscription
+
+Subscribes to ONVIF WS-PullPoint events from the camera — **no `onvif` npm library**, implemented directly via raw HTTP SOAP calls.
+
+### Why not the `onvif` npm library?
+
+The Tapo C225 has a very limited HTTP server. The `onvif` library's pull loop keeps running even after `removeListener()` is called, and when it hits an `ECONNRESET` (e.g. during privacy mode) it fires ~89 rapid-fire reconnect attempts starting at 10 ms intervals. This overwhelms the camera's embedded HTTP stack and causes it to freeze — responding to `ping` but refusing all HTTP connections — until the firmware recovers (30–60 s).
+
+This node replaces that with full control: zero requests while stopped, proper ONVIF `Unsubscribe` on stop, and exponential back-off (3 s → 6 s → … → 2 min max) that is harmless.
+
+### Node settings
+
+| Field | Description |
+|---|---|
+| Device | Select a `tapo-device` config node |
+| ONVIF port | Camera's ONVIF port (default **2020** for Tapo cameras) |
+| Action | Fixed action, or leave blank to use `msg.action` at runtime |
+| Poll hold | How long the camera holds each `PullMessages` request before returning empty (default **5 s**) |
+| Motion timeout | Silence duration before emitting `detected:false` — must be longer than the camera's batch interval (~14 s on C225). Default **30 s** |
+
+### Input
+
+| `msg.action` | Description |
+|---|---|
+| `"start"` | Subscribe and begin delivering events |
+| `"stop"` | Send ONVIF `Unsubscribe` to camera and halt all requests |
+
+### Output `msg.payload`
+
+```json
+{
+  "topic":    "RuleEngine/PeopleDetector/People",
+  "payload": {
+    "detected": true,
+    "time":     "2026-05-18T12:03:01Z",
+    "property": "Initialized",
+    "source":   { "Rule": "MyPeopleDetectorRule" },
+    "data":     { "IsMotion": "true" }
+  }
+}
+```
+
+`detected: false` is emitted after `motionTimeout` seconds of camera silence (watchdog).
+
+### Tapo C225 quirks
+
+The C225 does **not** send standard `Changed` events. Instead it broadcasts `Initialized` events in batches roughly every **14 s** while motion/person is present. The node handles this with:
+
+- A **300 ms debounce** per topic to coalesce one batch into a single output message.
+- A **watchdog timer** (configurable, default 30 s) that fires `detected:false` when the camera goes silent. The watchdog is reset on the **first event of each batch** to eliminate the race condition where watchdog and next batch arrive at the same millisecond.
+
+### Always-on vs start/stop
+
+| | Always-on (never stop) | Start/stop (stop on privacy ON) |
+|---|---|---|
+| Requests while privacy ON | 1 per 5 s (empty PullMessages) | Zero |
+| If camera refuses ONVIF during privacy | Back-off: 3 s → max 2 min between retries | Zero |
+| Flow complexity | Simple — single "start" on deploy | Need to sequence stop→privacy-on and privacy-off→start |
+| Risk | Minimal — our back-off is safe | Timing errors in sequencing can still cause flashes |
+
+**Recommendation: use always-on.** The C225 accepts ONVIF connections even during privacy mode (it just returns empty events). Our back-off is well-behaved and will never freeze the camera. Only switch to start/stop if you confirm the camera returns `ECONNRESET` during privacy mode (meaning it fully shuts down its ONVIF HTTP server then).
+
+If you do use start/stop, add a **1–2 s delay** between stopping ONVIF and sending the privacy command to give the camera time to process the `Unsubscribe` before new Tapo HTTPS connections arrive:
+
+```
+privacy ON  → [stop → tapo-onvif-events] ──1s delay──► [privacy-on  → tapo-local]
+privacy OFF → [privacy-off → tapo-local] ──1s delay──► [start → tapo-onvif-events]
+```
+
+---
+
+## Adding commands
+
+Open `lib/tapo-client.js` and append an entry to `COMMANDS`. No other file changes needed unless you want the command in the editor dropdown (`nodes/tapo-local.html`).
+
+```javascript
+const COMMANDS = {
+    // _direct: false (default) → wrapped in multipleRequest (pytapo executeFunction path)
+    // _direct: true            → sent as-is (pytapo performRequest path, for method:'set'/'do')
+
+    'my-command': { method: 'someMethod', params: { ... } },
+};
+```
+
+---
+
 ## CLI utility
 
 `scripts/tapo_privacy.js` is a standalone Node.js script for testing from the command line (no deps):
