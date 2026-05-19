@@ -419,21 +419,21 @@ module.exports = function (RED) {
                 if (!subscriptionUrl) {
                     try {
                         subscriptionUrl = await opCreateSubscription(
-                            eventUrl, user, getPass(), 60,
+                            eventUrl, user, getPass(), 120,
                             (req) => { currentReq = req; },
                         );
                         currentReq = null;
-                        // Renew subscription every 50 s (TTL = 60 s).
+                        // Renew subscription every 90 s (TTL = 120 s).
                         clearInterval(renewTimer);
                         renewTimer = setInterval(async () => {
                             if (!active || !subscriptionUrl) return;
                             try {
-                                await opRenew(subscriptionUrl, user, getPass());
+                                await opRenew(subscriptionUrl, user, getPass(), 120);
                             } catch (e) {
                                 node.warn('Subscription renew failed — will re-subscribe: ' + e.message);
                                 subscriptionUrl = null;
                             }
-                        }, 50000);
+                        }, 90000);
                         node.status({ fill: 'green', shape: 'dot', text: 'listening' });
                     } catch (err) {
                         if (!active) break;
@@ -507,7 +507,12 @@ module.exports = function (RED) {
         }
 
         // ── Public: stop ──────────────────────────────────────────────────────
-        async function doStop() {
+        // skipUnsubscribe=true → used by privacy-on coordination: we just RST the
+        // live request and let the subscription expire via TTL (120 s).  Sending an
+        // Unsubscribe would open a new connection immediately after the RST and
+        // occupy the C225's single connection slot, causing the subsequent Tapo
+        // HTTPS command to time out.
+        async function doStop(skipUnsubscribe = false) {
             if (!active && !subscriptionUrl) return;
             active = false;
             wakeUp();                   // abort any in-progress back-off sleep
@@ -516,21 +521,19 @@ module.exports = function (RED) {
             clearMotionState();
 
             // ── Abort any in-flight poll-loop request NOW (TCP RST). ─────────
-            // This covers GetCapabilities, CreateSubscription, and PullMessages —
-            // all three open HTTP connections that must be closed before the
-            // Tapo command or Unsubscribe can safely use the camera's one slot.
+            // This covers GetCapabilities, CreateSubscription, and PullMessages.
             if (currentReq) {
                 currentReq.destroy(new Error('stopped'));
                 currentReq = null;
             }
-            // Give the camera a moment to process the RST before we open
-            // a new connection for Unsubscribe.
-            await new Promise(r => setTimeout(r, 200));
+            // Give the camera's firmware time to fully release the TCP slot
+            // before the next connection (Unsubscribe or Tapo HTTPS).
+            await new Promise(r => setTimeout(r, 400));
 
             const subUrl    = subscriptionUrl;
             subscriptionUrl = null;
 
-            if (subUrl) {
+            if (!skipUnsubscribe && subUrl) {
                 try {
                     await opUnsubscribe(subUrl, user, getPass());
                 } catch (e) {
@@ -544,7 +547,9 @@ module.exports = function (RED) {
         // tapo-client awaits stop() before privacy-on (so the camera has one free
         // connection slot) and calls start() after privacy-off succeeds.
         registerOnvifCallbacks(ip, {
-            stop:  () => doStop(),   // async — tapo-client awaits the Unsubscribe
+            // skip Unsubscribe — sending it would open a connection right before
+            // the Tapo HTTPS command and freeze the C225 (one-connection limit).
+            stop:  () => doStop(true),
             start: () => doStart(),  // non-blocking — kicks off the poll loop
         });
 
@@ -567,7 +572,7 @@ module.exports = function (RED) {
             if (typeof removed === 'function') { done = removed; }  // Node-RED < 0.19
             closed = true;
             unregisterOnvifCallbacks(ip);
-            doStop().finally(() => done());
+            doStop(false).finally(() => done());  // full stop — send Unsubscribe on shutdown
         });
 
         // Auto-start unless explicitly disabled in config.

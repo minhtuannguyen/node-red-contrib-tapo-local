@@ -15,7 +15,7 @@
             name:          { value: '' },
             device:        { value: '', type: 'tapo-device', required: true },
             onvifPort:     { value: 2020,  validate: RED.validators.number() },
-            pullTimeout:   { value: 5,     validate: RED.validators.number() },
+            pullTimeout:   { value: 25,    validate: RED.validators.number() },
             motionTimeout: { value: 30,    validate: RED.validators.number() },
             autoStart:     { value: true },
         },
@@ -55,10 +55,11 @@
 
     <div class="form-row">
         <label for="node-input-pullTimeout"><i class="fa fa-clock-o"></i> Poll hold</label>
-        <input type="number" id="node-input-pullTimeout" min="1" max="60" style="width:70px"> seconds
+        <input type="number" id="node-input-pullTimeout" min="5" max="120" style="width:70px"> seconds
         <div style="font-size:0.82em;color:#888;margin-top:4px;margin-left:110px">
-            How long the camera holds each PullMessages request before returning empty
-            (default 5 s — reduces request frequency without adding latency).
+            How long the camera holds each PullMessages request before returning empty.
+            Longer = fewer requests per minute (25 s ≈ 2-3 req/min; 5 s ≈ 12 req/min).
+            C225 sends events early regardless, so latency is unaffected.
         </div>
     </div>
 
