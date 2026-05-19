@@ -539,7 +539,7 @@ module.exports = function (RED) {
 
         // ── Input handler ─────────────────────────────────────────────────────
         node.on('input', async (msg, send, done) => {
-            const action = msg.action ?? config.action;
+            const action = msg.action;
             if (action === 'start') {
                 doStart();
                 done();
@@ -559,7 +559,12 @@ module.exports = function (RED) {
             doStop().finally(() => done());
         });
 
-        node.status({ fill: 'grey', shape: 'ring', text: 'stopped' });
+        // Auto-start unless explicitly disabled in config.
+        if (config.autoStart !== false) {
+            doStart();
+        } else {
+            node.status({ fill: 'grey', shape: 'ring', text: 'stopped' });
+        }
     }
 
     RED.nodes.registerType('tapo-onvif-events', TapoOnvifEventsNode);

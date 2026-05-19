@@ -17,7 +17,7 @@
             onvifPort:     { value: 2020,  validate: RED.validators.number() },
             pullTimeout:   { value: 5,     validate: RED.validators.number() },
             motionTimeout: { value: 30,    validate: RED.validators.number() },
-            action:        { value: '' },
+            autoStart:     { value: true },
         },
 
         label: function () {
@@ -44,12 +44,11 @@
     </div>
 
     <div class="form-row">
-        <label for="node-input-action"><i class="fa fa-play"></i> Action</label>
-        <select id="node-input-action" style="width:200px">
-            <option value="">— set via msg.action —</option>
-            <option value="start">Start listening</option>
-            <option value="stop">Stop listening</option>
-        </select>
+        <label style="width:auto;margin-right:8px" for="node-input-autoStart">
+            <i class="fa fa-play-circle"></i> Auto-start
+        </label>
+        <input type="checkbox" id="node-input-autoStart" style="width:auto;vertical-align:middle">
+        <span style="margin-left:6px;color:#888;font-size:0.9em">Start listening automatically when Node-RED starts</span>
     </div>
 
     <hr style="margin:12px 0">
