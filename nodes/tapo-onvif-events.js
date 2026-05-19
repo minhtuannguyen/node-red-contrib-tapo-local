@@ -518,6 +518,22 @@ module.exports = function (RED) {
             wakeUp();                   // abort any in-progress back-off sleep
             clearInterval(renewTimer);
             renewTimer = null;
+
+            // When stopping due to privacy-on the camera's motion sensor is
+            // disabled, so emit detected:false for any topic that was active.
+            if (skipUnsubscribe) {
+                for (const key of Object.keys(motionActive)) {
+                    if (motionActive[key]) {
+                        safeSend({ topic: key, payload: {
+                            detected: false,
+                            time:     new Date().toISOString(),
+                            property: 'privacy',
+                            source:   ip,
+                            data:     {},
+                        }});
+                    }
+                }
+            }
             clearMotionState();
 
             // ── Abort any in-flight poll-loop request NOW (TCP RST). ─────────
