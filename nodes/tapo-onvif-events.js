@@ -27,6 +27,7 @@
 const http   = require('http');
 const https  = require('https');
 const crypto = require('crypto');
+const { registerOnvifCallbacks, unregisterOnvifCallbacks } = require('../lib/tapo-client');
 
 // ── WSSE UsernameToken digest auth (ONVIF §5 / WS-UsernameToken profile) ──────
 function wsseHeader(username, password) {
@@ -82,7 +83,9 @@ function soapEnvelope(body, username, password) {
 }
 
 // ── Raw HTTP/HTTPS SOAP POST (no keep-alive — camera has very limited sockets) ─
-function soapPost(urlStr, body, timeoutMs) {
+// _onReq (optional): called with the raw http.ClientRequest immediately after
+// creation so the caller can hold a reference and call req.destroy() to abort.
+function soapPost(urlStr, body, timeoutMs, _onReq) {
     return new Promise((resolve, reject) => {
         let parsed;
         try { parsed = new URL(urlStr); } catch (e) { return reject(new Error('Bad ONVIF URL: ' + urlStr)); }
@@ -109,6 +112,7 @@ function soapPost(urlStr, body, timeoutMs) {
             res.on('data', c => chunks.push(c));
             res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
         });
+        if (_onReq) _onReq(req);
         req.on('timeout', () => req.destroy(new Error(`ONVIF SOAP timeout (${timeoutMs}ms) — ${urlStr}`)));
         req.on('error', reject);
         req.write(data);
@@ -191,7 +195,8 @@ async function opCreateSubscription(eventUrl, user, pass, ttlSecs = 60) {
 
 // pullTimeoutSec: how long the camera holds the request open if no events.
 // HTTP timeout is set to pullTimeoutSec + 4 s to give the camera time to reply.
-async function opPullMessages(subUrl, user, pass, pullTimeoutSec, msgLimit = 100) {
+// _onReq: optional callback receiving the raw http.ClientRequest (for aborting).
+async function opPullMessages(subUrl, user, pass, pullTimeoutSec, msgLimit = 100, _onReq) {
     return soapPost(
         subUrl,
         soapEnvelope(
@@ -199,6 +204,7 @@ async function opPullMessages(subUrl, user, pass, pullTimeoutSec, msgLimit = 100
             user, pass,
         ),
         (pullTimeoutSec + 4) * 1000,
+        _onReq,
     );
 }
 
@@ -278,6 +284,8 @@ module.exports = function (RED) {
         let subscriptionUrl = null;    // active pull-point subscription URL
         let renewTimer      = null;    // setInterval for subscription renewal
         let wakeResolve     = null;    // resolves the current sleep() early on stop
+        let currentPullReq  = null;    // the live http.ClientRequest for PullMessages
+
 
         // Per-topic motion-detection state (reset on stop)
         let debounceTimers = {};
@@ -375,30 +383,30 @@ module.exports = function (RED) {
         }
 
         // ── Poll loop ─────────────────────────────────────────────────────────
-        // Runs until active === false.  Manages its own subscriptions and
-        // reconnects with exponential back-off on any error.
+        // Runs until active === false.
+        // On any ONVIF error: Unsubscribe (best effort), wait 5 s, then re-probe
+        // with GetCapabilities.  Flat 5 s retry — no exponential back-off — so
+        // the node recovers promptly without flooding the C225 with rapid requests.
         async function pollLoop() {
-            let backoffMs = 3000;
             node.status({ fill: 'blue', shape: 'dot', text: 'connecting…' });
 
             while (active) {
 
-                // Step 1: discover event service URL (cached across reconnects).
+                // Step 1: GetCapabilities — cached across reconnects; also acts as
+                // a liveness probe after any error (reset to null on error below).
                 if (!eventUrl) {
                     try {
-                        eventUrl  = await opGetCapabilities(deviceUrl, user, getPass());
-                        backoffMs = 3000;
+                        eventUrl = await opGetCapabilities(deviceUrl, user, getPass());
                     } catch (err) {
                         if (!active) break;
-                        node.warn(`GetCapabilities failed — retry in ${backoffMs / 1000}s: ${err.message}`);
-                        node.status({ fill: 'yellow', shape: 'ring', text: 'retrying…' });
-                        await sleep(backoffMs);
-                        backoffMs = Math.min(backoffMs * 2, 120000);
+                        node.warn(`GetCapabilities failed — retry in 5s: ${err.message}`);
+                        node.status({ fill: 'yellow', shape: 'ring', text: 'offline — retry in 5s' });
+                        await sleep(5000);
                         continue;
                     }
                 }
 
-                // Step 2: create pull-point subscription (re-created after any error).
+                // Step 2: create pull-point subscription.
                 if (!subscriptionUrl) {
                     try {
                         subscriptionUrl = await opCreateSubscription(eventUrl, user, getPass());
@@ -410,51 +418,61 @@ module.exports = function (RED) {
                                 await opRenew(subscriptionUrl, user, getPass());
                             } catch (e) {
                                 node.warn('Subscription renew failed — will re-subscribe: ' + e.message);
-                                subscriptionUrl = null;   // next iteration re-subscribes
+                                subscriptionUrl = null;
                             }
                         }, 50000);
                         node.status({ fill: 'green', shape: 'dot', text: 'listening' });
-                        backoffMs = 3000;
                     } catch (err) {
                         if (!active) break;
-                        node.warn(`CreateSubscription failed — retry in ${backoffMs / 1000}s: ${err.message}`);
-                        node.status({ fill: 'yellow', shape: 'ring', text: 'retrying…' });
-                        await sleep(backoffMs);
-                        backoffMs = Math.min(backoffMs * 2, 120000);
+                        eventUrl = null;  // force re-probe on next iteration
+                        node.warn(`CreateSubscription failed — retry in 5s: ${err.message}`);
+                        node.status({ fill: 'yellow', shape: 'ring', text: 'offline — retry in 5s' });
+                        await sleep(5000);
                         continue;
                     }
                 }
 
-                // Step 3: pull messages (camera holds the request ≤ pullTimeoutSec).
+                // Step 3: pull messages (camera holds the connection ≤ pullTimeoutSec).
+                // currentPullReq is tracked so doStop() can TCP-RST it immediately
+                // before opening the Unsubscribe connection.
                 let xml;
                 try {
-                    xml = await opPullMessages(subscriptionUrl, user, getPass(), pullTimeoutSec);
+                    xml = await opPullMessages(
+                        subscriptionUrl, user, getPass(), pullTimeoutSec, 100,
+                        (req) => { currentPullReq = req; },
+                    );
                 } catch (err) {
-                    if (!active) break;
-                    node.warn(`PullMessages error — retry in ${backoffMs / 1000}s: ${err.message}`);
-                    // Treat as subscription lost — re-subscribe on next iteration.
+                    currentPullReq = null;
+                    if (!active) break;   // destroyed by doStop() — exit cleanly
+
+                    // Camera unresponsive or subscription lost.
+                    // Unsubscribe (best effort), wait 5 s, then re-probe.
                     clearInterval(renewTimer);
-                    renewTimer = null;
+                    renewTimer      = null;
+                    const subUrl    = subscriptionUrl;
                     subscriptionUrl = null;
-                    node.status({ fill: 'yellow', shape: 'ring', text: 'reconnecting…' });
-                    await sleep(backoffMs);
-                    backoffMs = Math.min(backoffMs * 2, 120000);
+                    eventUrl        = null;  // re-probe on next iteration
+                    node.warn(`ONVIF error — retry in 5s: ${err.message}`);
+                    node.status({ fill: 'yellow', shape: 'ring', text: 'offline — retry in 5s' });
+                    if (subUrl) {
+                        try { await opUnsubscribe(subUrl, user, getPass()); } catch (_) {}
+                    }
+                    await sleep(5000);
                     continue;
                 }
+                currentPullReq = null;
                 if (!active) break;
 
                 // SOAP fault → subscription expired or invalid → re-subscribe.
                 if (/[Ff]ault/.test(xml)) {
-                    node.warn('PullMessages SOAP fault — re-subscribing');
+                    node.warn('PullMessages SOAP fault — re-subscribing in 5s');
                     clearInterval(renewTimer);
-                    renewTimer = null;
+                    renewTimer      = null;
                     subscriptionUrl = null;
-                    node.status({ fill: 'yellow', shape: 'ring', text: 'reconnecting…' });
-                    await sleep(3000);
+                    node.status({ fill: 'yellow', shape: 'ring', text: 'offline — retry in 5s' });
+                    await sleep(5000);
                     continue;
                 }
-
-                backoffMs = 3000;   // reset after a successful pull
 
                 const events = parseEvents(xml);
                 for (const ev of events) {
@@ -484,11 +502,23 @@ module.exports = function (RED) {
             renewTimer = null;
             clearMotionState();
 
-            const subUrl        = subscriptionUrl;
-            subscriptionUrl     = null;
+            // ── Critical: abort the in-flight PullMessages request NOW. ──────
+            // Without this, PullMessages holds the camera's connection open
+            // (up to pullTimeoutSec+4 s) while Unsubscribe tries to open a
+            // second connection.  The C225 can only handle one HTTP connection
+            // at a time — two simultaneous requests freeze its firmware.
+            // req.destroy() sends a TCP RST; the camera frees the slot in <10 ms.
+            if (currentPullReq) {
+                currentPullReq.destroy(new Error('stopped'));
+                currentPullReq = null;
+            }
+            // Give the camera a moment to process the RST before we open
+            // a new connection for Unsubscribe.
+            await new Promise(r => setTimeout(r, 200));
 
-            // Tell the camera to tear down the pull-point immediately so it
-            // frees its connection slot for the Tapo HTTPS API.
+            const subUrl    = subscriptionUrl;
+            subscriptionUrl = null;
+
             if (subUrl) {
                 try {
                     await opUnsubscribe(subUrl, user, getPass());
@@ -498,6 +528,14 @@ module.exports = function (RED) {
             }
             node.status({ fill: 'grey', shape: 'ring', text: 'stopped' });
         }
+
+        // ── Auto-coordination with tapo-local ─────────────────────────────────
+        // tapo-client awaits stop() before privacy-on (so the camera has one free
+        // connection slot) and calls start() after privacy-off succeeds.
+        registerOnvifCallbacks(ip, {
+            stop:  () => doStop(),   // async — tapo-client awaits the Unsubscribe
+            start: () => doStart(),  // non-blocking — kicks off the poll loop
+        });
 
         // ── Input handler ─────────────────────────────────────────────────────
         node.on('input', async (msg, send, done) => {
@@ -517,6 +555,7 @@ module.exports = function (RED) {
         node.on('close', (removed, done) => {
             if (typeof removed === 'function') { done = removed; }  // Node-RED < 0.19
             closed = true;
+            unregisterOnvifCallbacks(ip);
             doStop().finally(() => done());
         });
 
