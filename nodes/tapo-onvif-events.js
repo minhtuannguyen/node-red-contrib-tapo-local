@@ -159,7 +159,7 @@ function xmlAttr(fragment, attr) {
 }
 
 // ── ONVIF operations ──────────────────────────────────────────────────────────
-async function opGetCapabilities(deviceUrl, user, pass) {
+async function opGetCapabilities(deviceUrl, user, pass, _onReq = null) {
     const xml = await soapPost(
         deviceUrl,
         soapEnvelope(
@@ -167,6 +167,7 @@ async function opGetCapabilities(deviceUrl, user, pass) {
             user, pass,
         ),
         10000,
+        _onReq,
     );
     if (/[Ff]ault/.test(xml)) throw new Error('GetCapabilities SOAP fault: ' + xml.slice(0, 400));
     // Events XAddr is inside the <Events> or <tt:Events> element.
@@ -176,7 +177,7 @@ async function opGetCapabilities(deviceUrl, user, pass) {
     return xaddr;
 }
 
-async function opCreateSubscription(eventUrl, user, pass, ttlSecs = 60) {
+async function opCreateSubscription(eventUrl, user, pass, ttlSecs = 60, _onReq = null) {
     const xml = await soapPost(
         eventUrl,
         soapEnvelope(
@@ -184,6 +185,7 @@ async function opCreateSubscription(eventUrl, user, pass, ttlSecs = 60) {
             user, pass,
         ),
         10000,
+        _onReq,
     );
     if (/[Ff]ault/.test(xml)) throw new Error('CreatePullPointSubscription SOAP fault: ' + xml.slice(0, 400));
     // Address is inside <SubscriptionReference><Address>…</Address></SubscriptionReference>
@@ -284,7 +286,9 @@ module.exports = function (RED) {
         let subscriptionUrl = null;    // active pull-point subscription URL
         let renewTimer      = null;    // setInterval for subscription renewal
         let wakeResolve     = null;    // resolves the current sleep() early on stop
-        let currentPullReq  = null;    // the live http.ClientRequest for PullMessages
+        let currentReq       = null;    // the live http.ClientRequest for any poll-loop op
+                                         // (GetCapabilities, CreateSubscription, or PullMessages)
+                                         // doStop() destroys it to free the camera's connection slot
 
 
         // Per-topic motion-detection state (reset on stop)
@@ -396,8 +400,13 @@ module.exports = function (RED) {
                 // a liveness probe after any error (reset to null on error below).
                 if (!eventUrl) {
                     try {
-                        eventUrl = await opGetCapabilities(deviceUrl, user, getPass());
+                        eventUrl = await opGetCapabilities(
+                            deviceUrl, user, getPass(),
+                            (req) => { currentReq = req; },
+                        );
+                        currentReq = null;
                     } catch (err) {
+                        currentReq = null;
                         if (!active) break;
                         node.warn(`GetCapabilities failed — retry in 5s: ${err.message}`);
                         node.status({ fill: 'yellow', shape: 'ring', text: 'offline — retry in 5s' });
@@ -409,7 +418,11 @@ module.exports = function (RED) {
                 // Step 2: create pull-point subscription.
                 if (!subscriptionUrl) {
                     try {
-                        subscriptionUrl = await opCreateSubscription(eventUrl, user, getPass());
+                        subscriptionUrl = await opCreateSubscription(
+                            eventUrl, user, getPass(), 60,
+                            (req) => { currentReq = req; },
+                        );
+                        currentReq = null;
                         // Renew subscription every 50 s (TTL = 60 s).
                         clearInterval(renewTimer);
                         renewTimer = setInterval(async () => {
@@ -433,16 +446,16 @@ module.exports = function (RED) {
                 }
 
                 // Step 3: pull messages (camera holds the connection ≤ pullTimeoutSec).
-                // currentPullReq is tracked so doStop() can TCP-RST it immediately
+                // currentReq is tracked so doStop() can TCP-RST it immediately
                 // before opening the Unsubscribe connection.
                 let xml;
                 try {
                     xml = await opPullMessages(
                         subscriptionUrl, user, getPass(), pullTimeoutSec, 100,
-                        (req) => { currentPullReq = req; },
+                        (req) => { currentReq = req; },
                     );
                 } catch (err) {
-                    currentPullReq = null;
+                    currentReq = null;
                     if (!active) break;   // destroyed by doStop() — exit cleanly
 
                     // Camera unresponsive or subscription lost.
@@ -460,7 +473,7 @@ module.exports = function (RED) {
                     await sleep(5000);
                     continue;
                 }
-                currentPullReq = null;
+                currentReq = null;
                 if (!active) break;
 
                 // SOAP fault → subscription expired or invalid → re-subscribe.
@@ -502,15 +515,13 @@ module.exports = function (RED) {
             renewTimer = null;
             clearMotionState();
 
-            // ── Critical: abort the in-flight PullMessages request NOW. ──────
-            // Without this, PullMessages holds the camera's connection open
-            // (up to pullTimeoutSec+4 s) while Unsubscribe tries to open a
-            // second connection.  The C225 can only handle one HTTP connection
-            // at a time — two simultaneous requests freeze its firmware.
-            // req.destroy() sends a TCP RST; the camera frees the slot in <10 ms.
-            if (currentPullReq) {
-                currentPullReq.destroy(new Error('stopped'));
-                currentPullReq = null;
+            // ── Abort any in-flight poll-loop request NOW (TCP RST). ─────────
+            // This covers GetCapabilities, CreateSubscription, and PullMessages —
+            // all three open HTTP connections that must be closed before the
+            // Tapo command or Unsubscribe can safely use the camera's one slot.
+            if (currentReq) {
+                currentReq.destroy(new Error('stopped'));
+                currentReq = null;
             }
             // Give the camera a moment to process the RST before we open
             // a new connection for Unsubscribe.
