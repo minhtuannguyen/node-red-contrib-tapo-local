@@ -71,6 +71,7 @@
         <label for="node-input-command"><i class="fa fa-cog"></i> Command</label>
         <select id="node-input-command" style="width:70%">
             <optgroup label="Privacy">
+                <option value="get-lens-mask">Get lens mask state</option>
                 <option value="privacy-on">Privacy ON (lens covered)</option>
                 <option value="privacy-off">Privacy OFF (lens open)</option>
             </optgroup>
@@ -135,7 +136,7 @@
 
     <h3>Commands</h3>
     <ul>
-        <li><b>Privacy:</b> <code>privacy-on</code> — cover the lens; <code>privacy-off</code> — uncover</li>
+        <li><b>Privacy:</b> <code>get-lens-mask</code> — read current state (result in <code>msg.payload</code>); <code>privacy-on</code> — cover the lens; <code>privacy-off</code> — uncover</li>
         <li><b>Alarm (auto):</b> <code>alarm-on</code> / <code>alarm-off</code> — enable/disable alarm on detected events</li>
         <li><b>Alarm (manual):</b> <code>alarm-trigger</code> — immediately sound siren+light; <code>alarm-stop</code> — stop it</li>
         <li><b>Detection (AI):</b> <code>motion-on/off</code>, <code>person-on/off</code>,
