@@ -1,6 +1,6 @@
 {
     "name": "@minguyen68/node-red-contrib-tapo-local",
-    "version": "0.3.0",
+    "version": "0.3.1",
     "description": "Node-RED node for local control of Tapo C225 cameras — no cloud, no extra deps",
     "keywords": [
         "node-red",
@@ -12,8 +12,8 @@
     ],
     "node-red": {
         "nodes": {
-            "tapo-local":         "nodes/tapo-local.js",
-            "tapo-onvif-events":  "nodes/tapo-onvif-events.js"
+            "tapo-local": "nodes/tapo-local.js",
+            "tapo-onvif-events": "nodes/tapo-onvif-events.js"
         }
     },
     "author": "",
