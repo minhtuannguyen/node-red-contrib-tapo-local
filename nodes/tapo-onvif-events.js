@@ -27,7 +27,7 @@
 const http   = require('http');
 const https  = require('https');
 const crypto = require('crypto');
-const { registerOnvifCallbacks, unregisterOnvifCallbacks } = require('../lib/tapo-client');
+const { registerOnvifCallbacks, unregisterOnvifCallbacks, executeOnDevice } = require('../lib/tapo-client');
 
 // ── WSSE UsernameToken digest auth (ONVIF §5 / WS-UsernameToken profile) ──────
 function wsseHeader(username, password) {
@@ -281,14 +281,16 @@ module.exports = function (RED) {
 
         // ── Node state ────────────────────────────────────────────────────────
         let active          = false;   // true = poll loop should keep running
+        let stopping        = false;   // true while doStop() is in its async cleanup phase
         let closed          = false;   // node has been closed/removed
         let eventUrl        = null;    // discovered event service XAddr
         let subscriptionUrl = null;    // active pull-point subscription URL
         let renewTimer      = null;    // setInterval for subscription renewal
         let wakeResolve     = null;    // resolves the current sleep() early on stop
-        let currentReq       = null;    // the live http.ClientRequest for any poll-loop op
-                                         // (GetCapabilities, CreateSubscription, or PullMessages)
-                                         // doStop() destroys it to free the camera's connection slot
+        let currentReq      = null;    // the live http.ClientRequest for any poll-loop op
+                                       // (GetCapabilities, CreateSubscription, or PullMessages)
+                                       // doStop() destroys it to free the camera's connection slot
+        let retryMs         = 5000;    // GetCapabilities back-off: 5→10→20→40→60 s max
 
 
         // Per-topic motion-detection state (reset on stop)
@@ -405,12 +407,15 @@ module.exports = function (RED) {
                             (req) => { currentReq = req; },
                         );
                         currentReq = null;
+                        retryMs    = 5000;   // camera is reachable — reset back-off
                     } catch (err) {
                         currentReq = null;
                         if (!active) break;
-                        node.warn(`GetCapabilities failed — retry in 5s: ${err.message}`);
-                        node.status({ fill: 'yellow', shape: 'ring', text: 'offline — retry in 5s' });
-                        await sleep(5000);
+                        const label = `${retryMs / 1000}s`;
+                        node.warn(`GetCapabilities failed — retry in ${label}: ${err.message}`);
+                        node.status({ fill: 'yellow', shape: 'ring', text: `offline — retry in ${label}` });
+                        await sleep(retryMs);
+                        retryMs = Math.min(retryMs * 2, 60000);  // cap at 60 s
                         continue;
                     }
                 }
@@ -499,8 +504,12 @@ module.exports = function (RED) {
 
         // ── Public: start ─────────────────────────────────────────────────────
         function doStart() {
-            if (active) return;
-            active = true;
+            // `stopping`: doStop() is in its async cleanup phase — a new loop
+            // must not start until cleanup finishes, otherwise two loops could run
+            // concurrently and the old loop sees active=true and never exits.
+            if (active || stopping || closed) return;
+            active  = true;
+            retryMs = 5000;   // always start fresh with minimum back-off
             pollLoop().catch(err => {
                 node.error('Poll loop crashed unexpectedly: ' + err.message);
             });
@@ -514,8 +523,9 @@ module.exports = function (RED) {
         // HTTPS command to time out.
         async function doStop(skipUnsubscribe = false) {
             if (!active && !subscriptionUrl) return;
-            active = false;
-            wakeUp();                   // abort any in-progress back-off sleep
+            active   = false;
+            stopping = true;   // block doStart() until cleanup is complete
+            wakeUp();          // abort any in-progress back-off sleep
             clearInterval(renewTimer);
             renewTimer = null;
 
@@ -557,6 +567,7 @@ module.exports = function (RED) {
                 }
             }
             node.status({ fill: 'grey', shape: 'ring', text: 'stopped' });
+            stopping = false;  // cleanup done — doStart() may proceed
         }
 
         // ── Auto-coordination with tapo-local ─────────────────────────────────
@@ -592,8 +603,26 @@ module.exports = function (RED) {
         });
 
         // Auto-start unless explicitly disabled in config.
+        // On startup we don't know whether the camera is currently in privacy mode,
+        // so query the Tapo API first.  If privacy is on, stay idle — the tapo-local
+        // node will call doStart() via the registry when privacy-off is sent.
+        // If the query fails for any reason (wrong creds, camera offline), start
+        // the poll loop anyway so the node self-heals once the camera is reachable.
         if (config.autoStart !== false) {
-            doStart();
+            node.status({ fill: 'blue', shape: 'ring', text: 'checking privacy…' });
+            executeOnDevice(ip, user, getPass(), { method: 'getLensMaskConfig' })
+                .then(r => {
+                    const privacyOn = r?.lens_mask?.lens_mask_info?.enabled === 'on';
+                    if (privacyOn) {
+                        node.status({ fill: 'grey', shape: 'ring', text: 'privacy — idle' });
+                    } else {
+                        doStart();
+                    }
+                })
+                .catch(() => {
+                    // Can't determine state — start the poll loop and let it handle errors.
+                    doStart();
+                });
         } else {
             node.status({ fill: 'grey', shape: 'ring', text: 'stopped' });
         }
