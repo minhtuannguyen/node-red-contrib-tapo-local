@@ -46,6 +46,7 @@ Sends a command to the camera when triggered by any input message.
 | `msg.command` | Description |
 |---|---|
 | **Privacy** | |
+| `get-lens-mask` | Read current lens mask state — `msg.payload.result.lens_mask.lens_mask_info.enabled` is `"on"` or `"off"` |
 | `privacy-on` | Cover the lens (privacy mode on) |
 | `privacy-off` | Uncover the lens |
 | **Alarm** | |
