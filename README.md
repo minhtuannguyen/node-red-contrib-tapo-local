@@ -63,6 +63,8 @@ Sends a command to the camera when triggered by any input message.
 | `pet-off` | Disable pet detection |
 | `vehicle-on` | Enable vehicle detection |
 | `vehicle-off` | Disable vehicle detection |
+| `package-on` | Enable package delivery detection |
+| `package-off` | Disable package delivery detection |
 | `linecross-on` | Enable line crossing detection |
 | `linecross-off` | Disable line crossing detection |
 | `tamper-on` | Enable camera tamper detection |
@@ -84,9 +86,17 @@ Sends a command to the camera when triggered by any input message.
 | `night-vision-on` | Night vision always-on (IR active) |
 | `night-vision-off` | Night vision off (always day mode) |
 | `night-vision-auto` | Night vision auto-switch |
+| `flip-on` | Flip image vertically — for ceiling-mount installs |
+| `flip-off` | Disable vertical flip |
+| `record-audio-on` | Enable microphone recording |
+| `record-audio-off` | Disable microphone recording |
+| `circular-recording-on` | Enable circular (loop) SD recording — oldest footage overwritten when full |
+| `circular-recording-off` | Disable circular recording |
 | **System** | |
 | `reboot` | Reboot the camera |
 | **Monitor** | |
+| `get-device-info` | Device info — `msg.payload.result.device_info.basic_info` has model, firmware, MAC |
+| `get-sd-card` | SD card status — `msg.payload.result.harddisk_manage.hd_info` has status, total/free space |
 | `get-detections` | Poll recent detection events — see below |
 
 **Output `msg.payload`:**

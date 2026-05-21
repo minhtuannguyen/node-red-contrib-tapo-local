@@ -102,11 +102,15 @@
                 <option value="linecross-off">Line crossing detection OFF</option>
                 <option value="tamper-on">Camera tamper detection ON</option>
                 <option value="tamper-off">Camera tamper detection OFF</option>
+                <option value="package-on">Package detection ON</option>
+                <option value="package-off">Package detection OFF</option>
                 <option value="tracking-on">Auto-tracking ON</option>
                 <option value="tracking-off">Auto-tracking OFF</option>
             </optgroup>
             <optgroup label="Monitor">
                 <option value="get-detections">Get recent detections (poll)</option>
+                <option value="get-device-info">Get device info (model, firmware, MAC)</option>
+                <option value="get-sd-card">Get SD card status</option>
             </optgroup>
             <optgroup label="Camera">
                 <option value="led-on">LED ON</option>
@@ -114,6 +118,12 @@
                 <option value="night-vision-on">Night vision ON (always IR)</option>
                 <option value="night-vision-off">Night vision OFF (always day)</option>
                 <option value="night-vision-auto">Night vision AUTO</option>
+                <option value="flip-on">Image flip ON (ceiling mount)</option>
+                <option value="flip-off">Image flip OFF</option>
+                <option value="record-audio-on">Record audio ON</option>
+                <option value="record-audio-off">Record audio OFF</option>
+                <option value="circular-recording-on">Circular (loop) recording ON</option>
+                <option value="circular-recording-off">Circular (loop) recording OFF</option>
             </optgroup>
             <optgroup label="System">
                 <option value="reboot">Reboot</option>
@@ -140,7 +150,7 @@
         <li><b>Alarm (auto):</b> <code>alarm-on</code> / <code>alarm-off</code> — enable/disable alarm on detected events</li>
         <li><b>Alarm (manual):</b> <code>alarm-trigger</code> — immediately sound siren+light; <code>alarm-stop</code> — stop it</li>
         <li><b>Detection (AI):</b> <code>motion-on/off</code>, <code>person-on/off</code>,
-            <code>pet-on/off</code>, <code>vehicle-on/off</code>,
+            <code>pet-on/off</code>, <code>vehicle-on/off</code>, <code>package-on/off</code>,
             <code>baby-cry-on/off</code>, <code>glass-break-on/off</code>,
             <code>bark-on/off</code> (dog), <code>meow-on/off</code> (cat),
             <code>linecross-on/off</code>, <code>tamper-on/off</code>,
@@ -150,6 +160,10 @@
             Requires SD card + local recording enabled on the camera.</li>
         <li><b>LED:</b> <code>led-on</code> / <code>led-off</code></li>
         <li><b>Night vision:</b> <code>night-vision-on</code> (always IR) / <code>night-vision-off</code> (always day) / <code>night-vision-auto</code></li>
+        <li><b>Camera:</b> <code>flip-on/off</code> (vertical flip for ceiling mounts),
+            <code>record-audio-on/off</code>, <code>circular-recording-on/off</code></li>
+        <li><b>Monitor:</b> <code>get-device-info</code> — model, firmware, MAC;
+            <code>get-sd-card</code> — SD card status &amp; free space</li>
         <li><b>System:</b> <code>reboot</code></li>
     </ul>
 
