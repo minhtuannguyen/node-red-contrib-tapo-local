@@ -565,7 +565,7 @@ module.exports = function (RED) {
             }
             // Give the camera's firmware time to fully release the TCP slot
             // before the next connection (Unsubscribe or Tapo HTTPS).
-            await new Promise(r => setTimeout(r, 400));
+            await new Promise(r => setTimeout(r, 600));
 
             const subUrl    = subscriptionUrl;
             subscriptionUrl = null;
