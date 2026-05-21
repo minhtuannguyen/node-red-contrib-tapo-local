@@ -258,6 +258,17 @@ function parseEvents(xml) {
 // ── Node-RED registration ─────────────────────────────────────────────────────
 module.exports = function (RED) {
 
+    // ── Config node: ONVIF device ─────────────────────────────────────────────
+    function TapoOnvifDeviceNode(config) {
+        RED.nodes.createNode(this, config);
+        this.ip       = config.ip;
+        this.username = config.username;
+        // password stored in credentials (encrypted by Node-RED)
+    }
+    RED.nodes.registerType('tapo-onvif-device', TapoOnvifDeviceNode, {
+        credentials: { password: { type: 'password' } },
+    });
+
     function TapoOnvifEventsNode(config) {
         RED.nodes.createNode(this, config);
         const node = this;
