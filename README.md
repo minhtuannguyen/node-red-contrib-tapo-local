@@ -11,16 +11,31 @@ Node-RED node for **local** control of Tapo C225 cameras — no cloud required
 
 ## Nodes
 
-### `tapo-device` (config node)
+### `tapo-device` (config node — for `tapo-c225`)
 
-Registers a camera. Select it from any `tapo-c225` node.
+Registers a camera for the **tapo-c225** command node (Tapo local HTTPS API).
 
 | Field    | Description |
 |----------|-------------|
 | Name     | Optional display label |
 | IP       | Camera's local IP address, e.g. `192.168.1.100` |
 | Username | `admin` |
-| Password | Camera account password — find it in **Tapo app → Settings → Advanced → Camera Account** (may differ from your TP-Link cloud password) |
+| Password | The password you set when you **first added the camera to the Tapo app** — your TP-Link cloud/device password. |
+
+---
+
+### `tapo-onvif-device` (config node — for `tapo-onvif-events`)
+
+Registers a camera for the **tapo-onvif-events** node (ONVIF event subscription).
+
+| Field    | Description |
+|----------|-------------|
+| Name     | Optional display label |
+| IP       | Camera's local IP address, e.g. `192.168.1.100` |
+| Username | The username set in the Camera Account |
+| Password | The password set in **Tapo app → Settings → Advanced → Camera Account** — a separate local account, not your TP-Link cloud password. |
+
+> These two config nodes require **different credentials**. You need both if you use `tapo-c225` and `tapo-onvif-events` on the same camera.
 
 ---
 

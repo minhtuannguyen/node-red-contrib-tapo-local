@@ -34,9 +34,16 @@
 </script>
 
 <script type="text/html" data-help-name="tapo-device">
-    <p>Configuration for a Tapo C225 camera.</p>
-    <p>Use the camera account password from <b>Tapo app → Settings → Advanced → Camera Account</b>.
-    This may differ from your TP-Link cloud password.</p>
+    <p>Camera credentials for the <b>tapo-c225</b> command node (Tapo local HTTPS API).</p>
+    <p>
+        Username: <code>admin</code><br>
+        Password: the password you set when you first added the camera to the Tapo app
+        (your <b>TP-Link cloud / device password</b>, <em>not</em> the Camera Account).
+    </p>
+    <p>
+        For ONVIF event subscription use the separate <b>tapo-onvif-device</b> config node
+        provided by the <b>tapo-onvif-events</b> node.
+    </p>
 </script>
 
 

@@ -2,6 +2,52 @@
   tapo-onvif-events — Node-RED node UI
   Zero-dep ONVIF WS-PullPoint event subscription for Tapo C225.
 -->
+
+<!-- ── tapo-onvif-device config node ──────────────────────────────────────── -->
+<script type="text/javascript">
+    RED.nodes.registerType('tapo-onvif-device', {
+        category: 'config',
+        defaults: {
+            name:     { value: '' },
+            ip:       { value: '', required: true },
+            username: { value: 'admin', required: true },
+        },
+        credentials: {
+            password: { type: 'password' },
+        },
+        label: function () { return this.name || this.ip || 'Tapo ONVIF Device'; },
+    });
+</script>
+
+<script type="text/html" data-template-name="tapo-onvif-device">
+    <div class="form-row">
+        <label for="node-config-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-config-input-name" placeholder="optional label">
+    </div>
+    <div class="form-row">
+        <label for="node-config-input-ip"><i class="fa fa-globe"></i> IP</label>
+        <input type="text" id="node-config-input-ip" placeholder="192.168.1.100">
+    </div>
+    <div class="form-row">
+        <label for="node-config-input-username"><i class="fa fa-user"></i> Username</label>
+        <input type="text" id="node-config-input-username" placeholder="admin">
+    </div>
+    <div class="form-row">
+        <label for="node-config-input-password"><i class="fa fa-lock"></i> Password</label>
+        <input type="password" id="node-config-input-password">
+    </div>
+</script>
+
+<script type="text/html" data-help-name="tapo-onvif-device">
+    <p>Camera credentials for the <b>tapo-onvif-events</b> node (ONVIF event subscription).</p>
+    <p>
+        Use the <b>Camera Account</b> credentials from<br>
+        <b>Tapo app → Settings → Advanced → Camera Account</b>.
+    </p>
+    <p>
+        This is a separate local account — it is <strong>not</strong> your TP-Link cloud / device password.
+    </p>
+</script>
 <script type="text/javascript">
     RED.nodes.registerType('tapo-onvif-events', {
         category:     'Tapo',
@@ -13,7 +59,7 @@
 
         defaults: {
             name:          { value: '' },
-            device:        { value: '', type: 'tapo-device', required: true },
+            device:        { value: '', type: 'tapo-onvif-device', required: true },
             onvifPort:     { value: 2020,  validate: RED.validators.number() },
             pullTimeout:   { value: 25,    validate: RED.validators.number() },
             motionTimeout: { value: 30,    validate: RED.validators.number() },
