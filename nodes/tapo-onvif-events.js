@@ -610,7 +610,12 @@ module.exports = function (RED) {
         // the poll loop anyway so the node self-heals once the camera is reachable.
         if (config.autoStart !== false) {
             node.status({ fill: 'blue', shape: 'ring', text: 'checking privacy…' });
-            executeOnDevice(ip, user, getPass(), { method: 'getLensMaskConfig' })
+            // Race the Tapo query against a 5 s deadline so the node starts the
+            // poll loop quickly when the camera is offline (default REQUEST_TIMEOUT_MS
+            // is 12 s which leaves the node stuck on "checking privacy…" too long).
+            const checkDone    = executeOnDevice(ip, user, getPass(), { method: 'getLensMaskConfig' });
+            const checkTimeout = new Promise((_, rej) => setTimeout(() => rej(new Error('startup check timeout')), 5000));
+            Promise.race([checkDone, checkTimeout])
                 .then(r => {
                     const privacyOn = r?.lens_mask?.lens_mask_info?.enabled === 'on';
                     if (privacyOn) {
@@ -620,7 +625,8 @@ module.exports = function (RED) {
                     }
                 })
                 .catch(() => {
-                    // Can't determine state — start the poll loop and let it handle errors.
+                    // Camera offline or slow — start the poll loop and let exponential
+                    // back-off handle recovery (5 → 10 → 20 → 40 → 60 s cap).
                     doStart();
                 });
         } else {
