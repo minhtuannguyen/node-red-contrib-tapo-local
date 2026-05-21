@@ -63,8 +63,6 @@ Sends a command to the camera when triggered by any input message.
 | `pet-off` | Disable pet detection |
 | `vehicle-on` | Enable vehicle detection |
 | `vehicle-off` | Disable vehicle detection |
-| `package-on` | Enable package delivery detection |
-| `package-off` | Disable package delivery detection |
 | `linecross-on` | Enable line crossing detection |
 | `linecross-off` | Disable line crossing detection |
 | `tamper-on` | Enable camera tamper detection |
