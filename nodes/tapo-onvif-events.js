@@ -474,6 +474,9 @@ module.exports = function (RED) {
                     currentReq = null;
                     if (!active) break;   // destroyed by doStop() — exit cleanly
 
+                    // PTZ interrupt — slot freed for PTZ command; resume immediately.
+                    if (err.message === 'ptz-interrupt') continue;
+
                     // Camera unresponsive or subscription lost.
                     // Unsubscribe (best effort), wait 5 s, then re-probe.
                     clearInterval(renewTimer);
@@ -589,6 +592,16 @@ module.exports = function (RED) {
             // the Tapo HTTPS command and freeze the C225 (one-connection limit).
             stop:  () => doStop(true),
             start: () => doStart(),  // non-blocking — kicks off the poll loop
+            // PTZ coordination: abort the in-flight PullMessages so the camera's
+            // connection slot is free immediately for the PTZ SOAP command.
+            // The poll loop detects the 'ptz-interrupt' error and restarts cleanly.
+            interrupt: async () => {
+                if (!active || !currentReq) return;
+                currentReq.destroy(new Error('ptz-interrupt'));
+                currentReq = null;
+                // Brief pause — let the camera process the TCP RST before PTZ connects.
+                await new Promise(r => setTimeout(r, 200));
+            },
         });
 
         // ── Input handler ─────────────────────────────────────────────────────
