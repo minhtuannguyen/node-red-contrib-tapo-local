@@ -4,13 +4,14 @@
         category:  'Tapo',
         color:     '#00b4d8',
         defaults: {
-            name:      { value: '' },
-            device:    { value: '', type: 'tapo-onvif-device', required: true },
-            onvifPort: { value: '2020', validate: RED.validators.number() },
-            action:    { value: 'continuousMove' },
-            pan:       { value: '0' },
-            tilt:      { value: '0' },
-            preset:    { value: '' },
+            name:         { value: '' },
+            device:       { value: '', type: 'tapo-onvif-device', required: true },
+            onvifPort:    { value: '2020', validate: RED.validators.number() },
+            profileToken: { value: 'MediaProfile000' },
+            action:       { value: 'continuousMove' },
+            pan:          { value: '0' },
+            tilt:         { value: '0' },
+            preset:       { value: '' },
         },
         inputs:  1,
         outputs: 1,
@@ -42,6 +43,11 @@
     <div class="form-row">
         <label for="node-input-onvifPort"><i class="fa fa-plug"></i> ONVIF port</label>
         <input type="number" id="node-input-onvifPort" style="width:80px">
+    </div>
+    <div class="form-row">
+        <label for="node-input-profileToken"><i class="fa fa-id-card"></i> Profile token</label>
+        <input type="text" id="node-input-profileToken" style="width:200px" placeholder="MediaProfile000">
+        <span style="margin-left:8px;color:#888">C225 default: <code>MediaProfile000</code></span>
     </div>
     <div class="form-row">
         <label for="node-input-action"><i class="fa fa-arrows"></i> Action</label>

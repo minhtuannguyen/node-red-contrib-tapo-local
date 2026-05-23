@@ -46,10 +46,10 @@ module.exports = function (RED) {
 
         const deviceUrl = `http://${ip}:${onvifPort}/onvif/device_service`;
 
-        // Discovered once and cached for the lifetime of the node.
-        let ptzUrl       = null;   // PTZ service XAddr from GetCapabilities
-        let mediaUrl     = null;   // Media service XAddr from GetCapabilities
-        let profileToken = null;   // First profile token from GetProfiles
+        // Profile token is configured directly (default: MediaProfile000 for C225).
+        // PTZ service URL is discovered once from GetCapabilities then cached.
+        const profileToken = config.profileToken || 'MediaProfile000';
+        let ptzUrl         = null;   // PTZ service XAddr from GetCapabilities
 
         // ── Service discovery ─────────────────────────────────────────────────
         async function discoverServices() {
@@ -59,30 +59,14 @@ module.exports = function (RED) {
                 8000,
             );
             if (/[Ff]ault/.test(xml)) throw new Error('GetCapabilities SOAP fault: ' + xml.slice(0, 300));
-            // Extract PTZ XAddr (inside <PTZ> element) and Media XAddr (inside <Media>)
-            const ptzEl   = xmlInner(xml, 'PTZ');
-            const mediaEl = xmlInner(xml, 'Media');
-            ptzUrl   = xmlText(ptzEl,   'XAddr') || `http://${ip}:${onvifPort}/onvif/ptz_service`;
-            mediaUrl = xmlText(mediaEl, 'XAddr') || `http://${ip}:${onvifPort}/onvif/media_service`;
+            // Extract PTZ XAddr (inside <PTZ> element)
+            const ptzEl = xmlInner(xml, 'PTZ');
+            ptzUrl = xmlText(ptzEl, 'XAddr') || `http://${ip}:${onvifPort}/onvif/ptz_service`;
         }
 
-        async function discoverProfile() {
-            const xml = await soapPost(
-                mediaUrl || `http://${ip}:${onvifPort}/onvif/media_service`,
-                soapEnvelope('<trt:GetProfiles/>', user, getPass()),
-                8000,
-            );
-            if (/[Ff]ault/.test(xml)) throw new Error('GetProfiles SOAP fault: ' + xml.slice(0, 300));
-            const profiles = xmlFindAll(xml, 'Profiles');
-            if (!profiles.length) throw new Error('No media profiles found');
-            profileToken = xmlAttr(profiles[0], 'token');
-            if (!profileToken) throw new Error('Profile has no token attribute');
-        }
-
-        // Lazy-discover on first command; skip if already known.
+        // Lazy-discover PTZ URL on first command; skip if already known.
         async function ensureDiscovered() {
-            if (!ptzUrl)   await discoverServices();
-            if (!profileToken) await discoverProfile();
+            if (!ptzUrl) await discoverServices();
         }
 
         // ── PTZ command execution ─────────────────────────────────────────────
@@ -157,9 +141,9 @@ module.exports = function (RED) {
                 throw new Error(`Unknown PTZ action: "${action}". Use continuousMove, stop, gotoPreset, or getPresets.`);
             }
 
-            if (/[Ff]ault/.test(xml)) {
-                // SOAP fault may mean stale profile — clear so next call re-discovers.
-                profileToken = null;
+                if (/[Ff]ault/.test(xml)) {
+                // SOAP fault — clear cached PTZ URL so next call re-discovers.
+                ptzUrl = null;
                 throw new Error(`${action} SOAP fault: ` + xml.slice(0, 300));
             }
             return {};
@@ -190,7 +174,7 @@ module.exports = function (RED) {
         });
 
         node.on('close', () => {
-            ptzUrl = mediaUrl = profileToken = null;
+            ptzUrl = null;
         });
     }
 
