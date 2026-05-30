@@ -22,7 +22,7 @@
  * are not delayed by an in-flight PullMessages hold.
  */
 
-const { soapPost, soapEnvelope, xmlText, xmlFindAll, xmlAttr, xmlInner } = require('../lib/onvif-soap');
+const { soapPost, soapEnvelope, xmlText, xmlFindAll, xmlAttr, xmlInner, escXml } = require('../lib/onvif-soap');
 const { interruptOnvifForPtz } = require('../lib/tapo-client');
 
 module.exports = function (RED) {
@@ -113,7 +113,7 @@ module.exports = function (RED) {
                     soapEnvelope(
                         `<tptz:GotoPreset>` +
                         `<tptz:ProfileToken>${profileToken}</tptz:ProfileToken>` +
-                        `<tptz:PresetToken>${escXmlSimple(String(preset))}</tptz:PresetToken>` +
+                        `<tptz:PresetToken>${escXml(String(preset))}</tptz:PresetToken>` +
                         `</tptz:GotoPreset>`,
                         user, getPass(),
                     ),
@@ -166,7 +166,7 @@ module.exports = function (RED) {
             } catch (err) {
                 // On any connection failure clear cached URLs so next attempt re-discovers.
                 if (/timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND/.test(err.message)) {
-                    ptzUrl = mediaUrl = profileToken = null;
+                    ptzUrl = null;
                 }
                 node.status({ fill: 'red', shape: 'ring', text: err.message.slice(0, 50) });
                 done(err);
@@ -180,8 +180,3 @@ module.exports = function (RED) {
 
     RED.nodes.registerType('tapo-ptz', TapoPtzNode);
 };
-
-// Minimal XML escape for runtime values inserted into SOAP body.
-function escXmlSimple(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}

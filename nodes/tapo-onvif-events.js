@@ -24,139 +24,8 @@
  *   5. Unsubscribe on stop      → camera cleans up immediately
  */
 
-const http   = require('http');
-const https  = require('https');
-const crypto = require('crypto');
 const { registerOnvifCallbacks, unregisterOnvifCallbacks, executeOnDevice } = require('../lib/tapo-client');
-
-// ── WSSE UsernameToken digest auth (ONVIF §5 / WS-UsernameToken profile) ──────
-function wsseHeader(username, password) {
-    // Created: ISO 8601 without milliseconds (most cameras accept either)
-    const created = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
-    const nonce   = crypto.randomBytes(16);
-    // PasswordDigest = Base64(SHA-1( nonce_bytes ‖ created_utf8 ‖ password_utf8 ))
-    const digest  = crypto.createHash('sha1')
-        .update(Buffer.concat([
-            nonce,
-            Buffer.from(created,  'utf8'),
-            Buffer.from(password, 'utf8'),
-        ]))
-        .digest('base64');
-    return [
-        '<wsse:Security s:mustUnderstand="1"',
-        '  xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"',
-        '  xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-utility-1.0.xsd">',
-        '  <wsse:UsernameToken>',
-        `    <wsse:Username>${escXml(username)}</wsse:Username>`,
-        `    <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">${digest}</wsse:Password>`,
-        `    <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">${nonce.toString('base64')}</wsse:Nonce>`,
-        `    <wsu:Created>${created}</wsu:Created>`,
-        '  </wsse:UsernameToken>',
-        '</wsse:Security>',
-    ].join('\n');
-}
-
-function escXml(s) {
-    return String(s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-}
-
-// ── SOAP 1.2 envelope ─────────────────────────────────────────────────────────
-function soapEnvelope(body, username, password) {
-    return [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<s:Envelope',
-        '  xmlns:s="http://www.w3.org/2003/05/soap-envelope"',
-        '  xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"',
-        '  xmlns:wsa="http://www.w3.org/2005/08/addressing"',
-        '  xmlns:tev="http://www.onvif.org/ver10/events/wsdl"',
-        '  xmlns:tds="http://www.onvif.org/ver10/device/wsdl"',
-        '  xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"',
-        '  xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-utility-1.0.xsd">',
-        `  <s:Header>${wsseHeader(username, password)}</s:Header>`,
-        `  <s:Body>${body}</s:Body>`,
-        '</s:Envelope>',
-    ].join('\n');
-}
-
-// ── Raw HTTP/HTTPS SOAP POST (no keep-alive — camera has very limited sockets) ─
-// _onReq (optional): called with the raw http.ClientRequest immediately after
-// creation so the caller can hold a reference and call req.destroy() to abort.
-function soapPost(urlStr, body, timeoutMs, _onReq) {
-    return new Promise((resolve, reject) => {
-        let parsed;
-        try { parsed = new URL(urlStr); } catch (e) { return reject(new Error('Bad ONVIF URL: ' + urlStr)); }
-
-        const isHttps = parsed.protocol === 'https:';
-        const mod     = isHttps ? https : http;
-        const data    = Buffer.from(body, 'utf8');
-        const opts    = {
-            hostname:           parsed.hostname,
-            port:               parseInt(parsed.port, 10) || (isHttps ? 443 : 80),
-            path:               parsed.pathname + (parsed.search || ''),
-            method:             'POST',
-            headers:            {
-                'Content-Type':   'application/soap+xml; charset=utf-8',
-                'Content-Length': data.length,
-                'Connection':     'close',   // avoid leaving sockets open on the camera
-            },
-            timeout:            timeoutMs,
-            rejectUnauthorized: false,
-        };
-
-        const req = mod.request(opts, (res) => {
-            const chunks = [];
-            res.on('data', c => chunks.push(c));
-            res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-        });
-        if (_onReq) _onReq(req);
-        req.on('timeout', () => req.destroy(new Error(`ONVIF SOAP timeout (${timeoutMs}ms) — ${urlStr}`)));
-        req.on('error', reject);
-        req.write(data);
-        req.end();
-    });
-}
-
-// ── Minimal XML helpers — zero deps ──────────────────────────────────────────
-// Find all occurrences of <ns:tag .../> (self-closing) and
-// <ns:tag ...>content</ns:tag> (regular) — returned as full element strings.
-function xmlFindAll(xml, tag) {
-    const out = [];
-    let m;
-
-    // 1. Self-closing: <ns:tag attr="..."/>
-    const reSelf = new RegExp(`<(?:[\\w.-]+:)?${tag}(?:\\s[^>]*)?\\/>`, 'gi');
-    while ((m = reSelf.exec(xml)) !== null) out.push(m[0]);
-
-    // 2. Regular: <ns:tag ...>content</ns:tag> — non-greedy inner content
-    const reReg = new RegExp(
-        `<(?:[\\w.-]+:)?${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/(?:[\\w.-]+:)?${tag}>`,
-        'gi',
-    );
-    while ((m = reReg.exec(xml)) !== null) out.push(m[0]);
-
-    return out;
-}
-
-// Return inner text of the first matching element (regular tags only).
-function xmlInner(xml, tag) {
-    const re = new RegExp(
-        `<(?:[\\w.-]+:)?${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/(?:[\\w.-]+:)?${tag}>`,
-        'i',
-    );
-    const m = re.exec(xml);
-    return m ? m[1] : '';
-}
-
-function xmlText(xml, tag) { return xmlInner(xml, tag).trim(); }
-
-function xmlAttr(fragment, attr) {
-    const m = new RegExp(`\\b${attr}="([^"]*)"`, 'i').exec(fragment);
-    return m ? m[1] : null;
-}
+const { soapEnvelope, soapPost, xmlFindAll, xmlInner, xmlText, xmlAttr } = require('../lib/onvif-soap');
 
 // ── ONVIF operations ──────────────────────────────────────────────────────────
 async function opGetCapabilities(deviceUrl, user, pass, _onReq = null) {
@@ -366,7 +235,7 @@ module.exports = function (RED) {
 
             if (!batchActive[key]) {
                 batchActive[key]  = true;
-                const snap        = { ...ev };  // snapshot for delayed callbacks
+                const snap        = ev;  // ev is a fresh unique object from parseEvents — reference is safe
 
                 // If motion already active: reset watchdog immediately on the
                 // FIRST event of this batch, not 300 ms later in the debounce.
