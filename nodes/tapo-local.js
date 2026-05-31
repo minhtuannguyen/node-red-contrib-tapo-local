@@ -23,6 +23,7 @@ module.exports = function (RED) {
 
         if (!deviceNode) {
             node.error('No Tapo device configured');
+            node.status({ fill: 'red', shape: 'ring', text: 'no device' });
             return;
         }
 
