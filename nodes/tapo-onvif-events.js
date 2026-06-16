@@ -24,7 +24,7 @@
  *   5. Unsubscribe on stop      → camera cleans up immediately
  */
 
-const { registerOnvifCallbacks, unregisterOnvifCallbacks, executeOnDevice } = require('../lib/tapo-client');
+const { registerOnvifCallbacks, unregisterOnvifCallbacks, executeOnDevice, releaseSession } = require('../lib/tapo-client');
 const { soapEnvelope, soapPost, xmlFindAll, xmlInner, xmlText, xmlAttr } = require('../lib/onvif-soap');
 
 // ── ONVIF operations ──────────────────────────────────────────────────────────
@@ -79,7 +79,7 @@ async function opPullMessages(subUrl, user, pass, pullTimeoutSec, msgLimit = 100
     );
 }
 
-async function opRenew(subUrl, user, pass, ttlSecs = 60) {
+async function opRenew(subUrl, user, pass, ttlSecs = 60, _onReq = null) {
     return soapPost(
         subUrl,
         soapEnvelope(
@@ -87,6 +87,7 @@ async function opRenew(subUrl, user, pass, ttlSecs = 60) {
             user, pass,
         ),
         10000,
+        _onReq,
     );
 }
 
@@ -276,11 +277,72 @@ module.exports = function (RED) {
         async function pollLoop() {
             node.status({ fill: 'blue', shape: 'dot', text: 'connecting…' });
 
+            // Tracks whether we have already done the privacy-guard check for the
+            // current reconnect cycle.  Reset to false after a successful
+            // GetCapabilities so we re-check on the next disconnect/reconnect.
+            // Kept true during exponential back-off retries (camera still offline)
+            // to avoid adding a full 12 s REQUEST_TIMEOUT_MS per retry attempt.
+            let privacyGuardDone = false;
+
             while (active) {
 
                 // Step 1: GetCapabilities — cached across reconnects; also acts as
                 // a liveness probe after any error (reset to null on error below).
                 if (!eventUrl) {
+
+                    // ── Privacy guard before each ONVIF reconnect ────────────────
+                    // Before opening an ONVIF subscription, verify the camera is not
+                    // in privacy mode.  Running a PullMessages long-poll against a
+                    // C225 in privacy mode causes gradual firmware resource exhaustion
+                    // and an eventual crash — observed reproducibly after hours of
+                    // sustained ONVIF subscriptions with no motion events.
+                    //
+                    // This catches two scenarios the startup check cannot cover:
+                    //   A. Camera reboots slowly (>12 s to start HTTPS service) →
+                    //      startup check times out → doStart() fires → camera comes
+                    //      up in privacy mode → ONVIF loop reconnects → crash.
+                    //   B. Camera loses power while ONVIF is running → comes back in
+                    //      privacy mode → backoff loop reconnects without a privacy
+                    //      check → ONVIF subscription created → crash.
+                    //
+                    // Runs only ONCE per reconnect cycle (not on every retry while
+                    // the camera is still offline) to avoid a 12 s overhead per retry.
+                    if (!privacyGuardDone) {
+                        privacyGuardDone = true;
+                        let privacyOn = false;
+                        try {
+                            const lm = await executeOnDevice(ip, user, getPass(),
+                                { method: 'getLensMaskConfig' });
+                            privacyOn = lm?.lens_mask?.lens_mask_info?.enabled === 'on';
+                        } catch (_) {
+                            // Camera unreachable — privacy state unknown.  Proceed to
+                            // GetCapabilities which handles offline retry with
+                            // exponential back-off.
+                        } finally {
+                            // Always release the HTTPS session so the camera's single
+                            // TCP slot is free for the upcoming ONVIF SOAP calls.
+                            // The Tapo HTTPS agent holds an idle keep-alive socket
+                            // that would otherwise block the ONVIF connection attempt.
+                            releaseSession(ip, user);
+                        }
+                        if (!active) break;
+
+                        if (privacyOn) {
+                            // Camera is in privacy mode — stay idle.
+                            // The tapo-local privacy-off command will call doStart()
+                            // via the registry when privacy is disabled.
+                            node.status({ fill: 'grey', shape: 'ring', text: 'privacy — idle' });
+                            active = false;
+                            break;
+                        }
+
+                        // Brief pause for the camera's TCP stack to fully release
+                        // the HTTPS slot after agent.destroy() (the RST may leave
+                        // the slot in a transient FIN_WAIT state for a short time).
+                        await new Promise(r => setTimeout(r, 300));
+                        if (!active) break;
+                    }
+
                     try {
                         eventUrl = await opGetCapabilities(
                             deviceUrl, user, getPass(),
@@ -288,6 +350,7 @@ module.exports = function (RED) {
                         );
                         currentReq = null;
                         retryMs    = 5000;   // camera is reachable — reset back-off
+                        privacyGuardDone = false;  // reconnected — re-arm guard for next disconnect
                     } catch (err) {
                         currentReq = null;
                         if (!active) break;
@@ -313,8 +376,18 @@ module.exports = function (RED) {
                         renewTimer = setInterval(async () => {
                             if (!active || !subscriptionUrl) return;
                             try {
-                                await opRenew(subscriptionUrl, user, getPass(), 120);
+                                // Store the renewal request in currentReq so doStop() can
+                                // abort it immediately via TCP RST.  Without this, doStop()
+                                // would declare "slot free" after only 600 ms while an
+                                // opRenew() with a 10 s timeout is still in flight — causing
+                                // the subsequent privacy-on HTTPS command to collide on the
+                                // camera's single TCP connection slot.
+                                await opRenew(subscriptionUrl, user, getPass(), 120,
+                                    req => { currentReq = req; });
+                                currentReq = null;
                             } catch (e) {
+                                currentReq = null;
+                                if (!active) return;  // doStop() aborted the request — expected
                                 node.warn('Subscription renew failed — will re-subscribe: ' + e.message);
                                 subscriptionUrl = null;
                             }
@@ -503,11 +576,15 @@ module.exports = function (RED) {
         // the poll loop anyway so the node self-heals once the camera is reachable.
         if (config.autoStart !== false) {
             node.status({ fill: 'blue', shape: 'ring', text: 'checking privacy…' });
-            // Race the Tapo query against a 5 s deadline so the node starts the
-            // poll loop quickly when the camera is offline (default REQUEST_TIMEOUT_MS
-            // is 12 s which leaves the node stuck on "checking privacy…" too long).
+            // Race the Tapo query against a 15 s deadline.  15 s > REQUEST_TIMEOUT_MS
+            // (12 s) so the executeOnDevice timeout always fires first on an offline
+            // camera — the artificial timeout is a safety net only.  This prevents the
+            // previous 5 s race from firing prematurely when the camera is slow to
+            // respond (e.g. still booting after a power-cycle while in privacy mode),
+            // which would cause doStart() to launch the ONVIF poll loop incorrectly and
+            // hammer the camera before it has fully initialised.
             const checkDone    = executeOnDevice(ip, user, getPass(), { method: 'getLensMaskConfig' });
-            const checkTimeout = new Promise((_, rej) => setTimeout(() => rej(new Error('startup check timeout')), 5000));
+            const checkTimeout = new Promise((_, rej) => setTimeout(() => rej(new Error('startup check timeout')), 15000));
             Promise.race([checkDone, checkTimeout])
                 .then(r => {
                     const privacyOn = r?.lens_mask?.lens_mask_info?.enabled === 'on';
@@ -518,8 +595,8 @@ module.exports = function (RED) {
                     }
                 })
                 .catch(() => {
-                    // Camera offline or slow — start the poll loop and let exponential
-                    // back-off handle recovery (5 → 10 → 20 → 40 → 60 s cap).
+                    // Camera offline (12 s REQUEST_TIMEOUT_MS elapsed) — start the poll
+                    // loop and let exponential back-off handle recovery (5 → 60 s cap).
                     doStart();
                 });
         } else {
