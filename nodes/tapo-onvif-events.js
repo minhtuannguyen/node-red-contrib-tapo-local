@@ -25,7 +25,7 @@
  */
 
 const { registerOnvifCallbacks, unregisterOnvifCallbacks, executeOnDevice, releaseSession } = require('../lib/tapo-client');
-const { soapEnvelope, soapPost, xmlFindAll, xmlInner, xmlText, xmlAttr } = require('../lib/onvif-soap');
+const { soapEnvelope, soapPost, dropRoute, xmlFindAll, xmlInner, xmlText, xmlAttr } = require('../lib/onvif-soap');
 
 // ── ONVIF operations ──────────────────────────────────────────────────────────
 async function opGetCapabilities(deviceUrl, user, pass, _onReq = null) {
@@ -145,7 +145,12 @@ module.exports = function (RED) {
 
         const deviceNode      = RED.nodes.getNode(config.device);
         const onvifPort       = parseInt(config.onvifPort,    10) || 2020;
-        const pullTimeoutSec  = parseInt(config.pullTimeout,  10) || 5;
+        // Default 25 s matches the HTML default in tapo-onvif-events.html.  This
+        // controls ONVIF PullMessages long-poll duration.  Higher = fewer requests
+        // per minute (25 s ≈ 2–3 req/min; 5 s ≈ 12 req/min).  Event delivery
+        // latency is unaffected — the camera flushes the response as soon as
+        // events arrive, regardless of the timeout ceiling.
+        const pullTimeoutSec  = parseInt(config.pullTimeout,  10) || 25;
         const motionTimeoutMs = (parseInt(config.motionTimeout, 10) || 30) * 1000;
 
         if (!deviceNode) {
@@ -189,14 +194,17 @@ module.exports = function (RED) {
         }
 
         // Interruptible sleep — wakeUp() resolves it immediately.
+        // Nulls wakeResolve on natural completion so the closure (holding the
+        // fired timer + settled resolve) can be GC'd promptly instead of hanging
+        // around until the next sleep() overwrites it.
         function sleep(ms) {
             return new Promise(resolve => {
-                const t    = setTimeout(resolve, ms);
-                wakeResolve = () => { clearTimeout(t); resolve(); };
+                const t = setTimeout(() => { wakeResolve = null; resolve(); }, ms);
+                wakeResolve = () => { clearTimeout(t); wakeResolve = null; resolve(); };
             });
         }
         function wakeUp() {
-            if (wakeResolve) { wakeResolve(); wakeResolve = null; }
+            if (wakeResolve) wakeResolve();  // wakeResolve nulls itself
         }
 
         // Guard against sending after the node is closed.
@@ -389,7 +397,13 @@ module.exports = function (RED) {
                                 currentReq = null;
                                 if (!active) return;  // doStop() aborted the request — expected
                                 node.warn('Subscription renew failed — will re-subscribe: ' + e.message);
+                                if (subscriptionUrl) dropRoute(subscriptionUrl);  // release cached route
                                 subscriptionUrl = null;
+                                // Stop the interval NOW — otherwise it keeps firing every 90 s
+                                // as no-ops until the concurrent PullMessages finally errors out
+                                // and clears it.  On a broken camera those idle wake-ups pile up.
+                                clearInterval(renewTimer);
+                                renewTimer = null;
                             }
                         }, 90000);
                         node.status({ fill: 'green', shape: 'dot', text: 'listening' });
@@ -420,7 +434,13 @@ module.exports = function (RED) {
                     if (err.message === 'ptz-interrupt') continue;
 
                     // Camera unresponsive or subscription lost.
-                    // Unsubscribe (best effort), wait 5 s, then re-probe.
+                    // Skip Unsubscribe here on purpose:
+                    //   • If the camera is offline, opUnsubscribe would just burn
+                    //     its own 5 s timeout and add another wasted request to
+                    //     an already-struggling device.
+                    //   • If only the subscription died, the pull-point still
+                    //     expires naturally via its 120 s TTL — no cleanup needed.
+                    // doStop() (intentional shutdown) still sends Unsubscribe.
                     clearInterval(renewTimer);
                     renewTimer      = null;
                     const subUrl    = subscriptionUrl;
@@ -428,9 +448,7 @@ module.exports = function (RED) {
                     eventUrl        = null;  // re-probe on next iteration
                     node.warn(`ONVIF error — retry in 5s: ${err.message}`);
                     node.status({ fill: 'yellow', shape: 'ring', text: 'offline — retry in 5s' });
-                    if (subUrl) {
-                        try { await opUnsubscribe(subUrl, user, getPass()); } catch (_) {}
-                    }
+                    if (subUrl) dropRoute(subUrl);  // release cached route — URL is unique per subscription
                     await sleep(5000);
                     continue;
                 }
@@ -442,6 +460,7 @@ module.exports = function (RED) {
                     node.warn('PullMessages SOAP fault — re-subscribing in 5s');
                     clearInterval(renewTimer);
                     renewTimer      = null;
+                    if (subscriptionUrl) dropRoute(subscriptionUrl);  // release cached route
                     subscriptionUrl = null;
                     node.status({ fill: 'yellow', shape: 'ring', text: 'offline — retry in 5s' });
                     await sleep(5000);
@@ -522,6 +541,11 @@ module.exports = function (RED) {
                     node.warn('Unsubscribe failed (ignored): ' + e.message);
                 }
             }
+            // Release the cached SOAP route for this subscription URL.  Each
+            // CreatePullPointSubscription mints a new URL, so without this the
+            // route cache would grow by one entry every stop/start (privacy
+            // toggle, camera reboot, PullMessages error, node-red restart …).
+            if (subUrl) dropRoute(subUrl);
             node.status({ fill: 'grey', shape: 'ring', text: 'stopped' });
             stopping = false;  // cleanup done — doStart() may proceed
         }
@@ -565,7 +589,15 @@ module.exports = function (RED) {
             if (typeof removed === 'function') { done = removed; }  // Node-RED < 0.19
             closed = true;
             unregisterOnvifCallbacks(ip);
-            doStop(false).finally(() => done());  // full stop — send Unsubscribe on shutdown
+            doStop(false).finally(() => {
+                // Drop the stable per-camera routes from the shared route cache.
+                // ROUTE_CACHE_MAX already caps growth defensively, but on a redeploy
+                // the new instance will re-populate the cache anyway — so freeing the
+                // old entries costs nothing and keeps the cache clean.
+                dropRoute(deviceUrl);
+                if (eventUrl) dropRoute(eventUrl);
+                done();
+            });
         });
 
         // Auto-start unless explicitly disabled in config.
@@ -584,7 +616,10 @@ module.exports = function (RED) {
             // which would cause doStart() to launch the ONVIF poll loop incorrectly and
             // hammer the camera before it has fully initialised.
             const checkDone    = executeOnDevice(ip, user, getPass(), { method: 'getLensMaskConfig' });
-            const checkTimeout = new Promise((_, rej) => setTimeout(() => rej(new Error('startup check timeout')), 15000));
+            let startupTimer   = null;
+            const checkTimeout = new Promise((_, rej) => {
+                startupTimer = setTimeout(() => rej(new Error('startup check timeout')), 15000);
+            });
             Promise.race([checkDone, checkTimeout])
                 .then(r => {
                     const privacyOn = r?.lens_mask?.lens_mask_info?.enabled === 'on';
@@ -598,6 +633,19 @@ module.exports = function (RED) {
                     // Camera offline (12 s REQUEST_TIMEOUT_MS elapsed) — start the poll
                     // loop and let exponential back-off handle recovery (5 → 60 s cap).
                     doStart();
+                })
+                .finally(() => {
+                    // Clear the losing arm of the race so its setTimeout does not stay
+                    // armed for the full 15 s after checkDone already resolved.
+                    if (startupTimer) clearTimeout(startupTimer);
+                    // Attach no-op catches to BOTH arms.  Whichever one lost the race
+                    // is still pending (or already rejected) and would otherwise emit
+                    // an "unhandledRejection" on Node when it eventually settles:
+                    //   - checkTimeout won → checkDone still in flight against a slow
+                    //     camera; will reject 12+ s later with no listener.
+                    //   - checkDone won   → checkTimeout still armed; will reject at 15 s.
+                    checkDone.catch(() => {});
+                    checkTimeout.catch(() => {});
                 });
         } else {
             node.status({ fill: 'grey', shape: 'ring', text: 'stopped' });
