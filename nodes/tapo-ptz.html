@@ -52,7 +52,7 @@
     <div class="form-row">
         <label for="node-input-action"><i class="fa fa-arrows"></i> Action</label>
         <select id="node-input-action" style="width:70%">
-            <option value="continuousMove">Continuous Move (pan/tilt until Stop)</option>
+            <option value="continuousMove">Continuous Move (Stop or 5 seconds)</option>
             <option value="stop">Stop</option>
             <option value="gotoPreset">Go to Preset</option>
             <option value="getPresets">Get Presets</option>
@@ -81,7 +81,7 @@
     <p>Select a <b>tapo-onvif-device</b> config node (Camera Account credentials).</p>
     <h3>Actions</h3>
     <dl class="message-properties">
-        <dt>continuousMove</dt><dd>Move at pan/tilt speed until a <em>stop</em> command.</dd>
+        <dt>continuousMove</dt><dd>Move at pan/tilt speed until a <em>stop</em> command or the five-second camera-side timeout.</dd>
         <dt>stop</dt><dd>Stop all movement.</dd>
         <dt>gotoPreset</dt><dd>Move to a preset position by token.</dd>
         <dt>getPresets</dt><dd>Return preset list in <code>msg.payload</code>.</dd>

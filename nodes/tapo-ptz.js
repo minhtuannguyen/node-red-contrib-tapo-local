@@ -23,7 +23,7 @@
  */
 
 const { soapPost, soapEnvelope, xmlText, xmlFindAll, xmlAttr, xmlInner, escXml } = require('../lib/onvif-soap');
-const { interruptOnvifForPtz, acquireLease } = require('../lib/tapo-client');
+const { interruptOnvifForPtz, acquireLease, configureProtection, controlDelayMs, onvifDelayMs, noteOnvifFailure, noteOnvifSuccess, normalizeHost, _limits: LIMITS } = require('../lib/tapo-client');
 const { performance } = require('perf_hooks');
 
 const monotonicNow = () => performance.now();
@@ -37,18 +37,27 @@ const PTZ_QUEUE_MAX   = 4;
 const PTZ_ACTIONS     = new Set(['continuousMove', 'stop', 'gotoPreset', 'getPresets']);
 const PTZ_BACKOFF_MIN = 3000;
 const PTZ_BACKOFF_MAX = 30000;
-const NET_ERR_RE      = /timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|EHOSTDOWN|ENETUNREACH|ENOTFOUND|EAI_AGAIN|socket hang up|closed before response|ONVIF HTTP/;
+const MOVE_TIMEOUT_MS  = 5000;  // must match <tptz:Timeout> in ContinuousMove
+const MOVE_MARGIN_MS   = 1500;
+const NET_ERR_RE      = /timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|EHOSTDOWN|ENETUNREACH|ENOTFOUND|EAI_AGAIN|socket hang up|closed before response/;
 const _ptzDevices     = new Map(); // ip → { tail, waiting: [], failures, blockedUntil }
 
 function ptzDevice(ip) {
     let d = _ptzDevices.get(ip);
-    if (!d) { d = { tail: Promise.resolve(), waiting: [], failures: 0, blockedUntil: 0 }; _ptzDevices.set(ip, d); }
+    if (!d) {
+        d = { waiting: [], running: false, failures: 0, blockedUntil: 0, lastDone: -Infinity, movingUntil: 0 };
+        _ptzDevices.set(ip, d);
+    }
     return d;
 }
 
-function assertPtzAvailable(ip, d) {
-    if (monotonicNow() < d.blockedUntil) {
-        const secs = Math.ceil((d.blockedUntil - monotonicNow()) / 1000);
+// A Stop is only urgent while an attempted move can still be running on the camera.
+const mayBeMoving = d => monotonicNow() < d.movingUntil;
+
+function assertPtzAvailable(ip, d, action) {
+    const remaining = Math.max(d.blockedUntil - monotonicNow(), onvifDelayMs(ip), controlDelayMs(ip));
+    if (remaining > 0 && !(action === 'stop' && mayBeMoving(d))) {
+        const secs = Math.ceil(remaining / 1000);
         throw new Error(`Camera ${ip} unreachable — PTZ not sent, retry in ${secs}s`);
     }
 }
@@ -56,38 +65,76 @@ function assertPtzAvailable(ip, d) {
 // Resolves with the result, or with { superseded: true } if a newer move/stop replaced it.
 function enqueuePtz(ip, action, run) {
     const d = ptzDevice(ip);
-    assertPtzAvailable(ip, d);
+    assertPtzAvailable(ip, d, action);
     const movement = action === 'continuousMove' || action === 'stop';
     if (movement) {
-        for (const w of d.waiting) if (w.movement && !w.cancelled) w.cancelled = true;
+        for (const waiting of d.waiting.filter(entry => entry.movement)) waiting.resolve({ superseded: true });
+        d.waiting = d.waiting.filter(entry => !entry.movement);
     }
-    if (d.waiting.filter(w => !w.cancelled).length >= PTZ_QUEUE_MAX) {
+    if (d.waiting.length >= PTZ_QUEUE_MAX) {
         throw new Error(`PTZ queue for ${ip} is full — command dropped`);
     }
-    const entry = { movement, cancelled: false };
-    d.waiting.push(entry);
-    const op = d.tail.then(async () => {
-        d.waiting.splice(d.waiting.indexOf(entry), 1);
-        if (entry.cancelled) return { superseded: true };
-        assertPtzAvailable(ip, d);
+    const result = new Promise((resolve, reject) => {
+        d.waiting.push({ action, movement, run, resolve, reject, enqueuedAt: monotonicNow() });
+    });
+    if (!d.running) {
+        d.running = true;
+        drainPtz(ip, d);
+    }
+    return result;
+}
+
+async function drainPtz(ip, d) {
+    while (d.waiting.length) {
+        const entry = d.waiting[0];
+        if (entry.action !== 'stop' && monotonicNow() - entry.enqueuedAt > LIMITS.ptzMaxAgeMs) {
+            d.waiting.shift();
+            entry.reject(new Error('PTZ command expired - stale button press dropped'));
+            continue;
+        }
+        const urgentStop = entry.action === 'stop' && mayBeMoving(d);
+        const gap = urgentStop ? 0 : d.lastDone + LIMITS.ptzGapMs - monotonicNow();
+        if (gap > 0) {
+            await new Promise(resolve => setTimeout(resolve, Math.min(gap, LIMITS.ptzMaxAgeMs)));
+            continue;
+        }
+        d.waiting.shift();
+        const priorMoving = d.movingUntil;
+        let notSent = true;
         try {
-            const result = await run();
+            if (entry.action !== 'stop' && monotonicNow() - entry.enqueuedAt > LIMITS.ptzMaxAgeMs) {
+                throw new Error('PTZ command expired - stale button press dropped');
+            }
+            assertPtzAvailable(ip, d, entry.action);
+            if (entry.action === 'continuousMove') d.movingUntil = Infinity;
+            notSent = false;
+            const result = await entry.run(entry.enqueuedAt, urgentStop);
             d.failures = 0;
             d.blockedUntil = 0;
-            return result;
+            noteOnvifSuccess(ip);
+            entry.resolve(result);
         } catch (err) {
-            if (NET_ERR_RE.test(err.message)) {
+            if (err.notSent) notSent = true;
+            const soapFault = /SOAP fault/.test(err.message);
+            const authFailure = /NotAuthorized|Unauthorized|authentication|ONVIF HTTP (401|403)\b/i.test(err.message);
+            if (authFailure || (!soapFault && (NET_ERR_RE.test(err.message) || err.httpStatus === 429 || err.httpStatus >= 500))) {
+                noteOnvifFailure(ip, err);
                 d.failures++;
                 d.blockedUntil = monotonicNow() + Math.min(PTZ_BACKOFF_MIN * 2 ** Math.min(d.failures - 1, 10), PTZ_BACKOFF_MAX);
             }
-            throw err;
+            entry.reject(err);
+        } finally {
+            if (entry.action === 'continuousMove') d.movingUntil = notSent ? priorMoving : monotonicNow() + MOVE_TIMEOUT_MS + MOVE_MARGIN_MS;
+            else if (entry.action === 'stop') d.movingUntil = 0;
+            d.lastDone = monotonicNow();
+            d.lastAction = entry.action;
         }
-    });
-    d.tail = op.catch(() => {});
-    return op;
+    }
+    d.running = false;
 }
 
 module.exports = function (RED) {
+    configureProtection(RED);
 
     function TapoPtzNode(config) {
         RED.nodes.createNode(this, config);
@@ -102,7 +149,7 @@ module.exports = function (RED) {
             return;
         }
 
-        const ip      = deviceNode.ip;
+        const ip      = normalizeHost(deviceNode.ip);
         const user    = deviceNode.username;
         const getPass = () => deviceNode.credentials.password;
 
@@ -115,10 +162,12 @@ module.exports = function (RED) {
         let closed         = false;
 
         // Aborts the in-flight SOAP request once the lease has expired, so PTZ never overlaps HTTPS work.
-        let ptzReq = null, leaseExpired = false;
+        let ptzReq = null, activeLease = null, leaseExpired = false, commandExpiresAt = Infinity;
         const trackReq = req => {
+            if (activeLease) activeLease.trackRequest(req);
             if (closed) req.destroy(new Error('PTZ node closed'));
             else if (leaseExpired) req.destroy(new Error('PTZ lease expired'));
+            else if (monotonicNow() > commandExpiresAt) req.destroy(new Error('PTZ command expired'));
             else ptzReq = req;
         };
 
@@ -142,19 +191,25 @@ module.exports = function (RED) {
         }
 
         // ── PTZ command execution ─────────────────────────────────────────────
-        async function execPtz(action, pan, tilt, preset) {
+        async function execPtz(action, pan, tilt, preset, enqueuedAt, urgentStop) {
             if (closed) throw new Error('PTZ node closed');
             // Exclusive hold on the camera's HTTPS queue, so no HTTPS login/command overlaps this PTZ call.
-            // A Stop is never withheld: without the lease or the ONVIF pause it is still sent.
-            const mustSend = action === 'stop';
-            const lease = await acquireLease(ip, { waitMs: mustSend ? 1500 : 5000, stillWanted: () => !closed });
+            // Only a Stop that follows a recent move is never withheld; any other Stop obeys cooldowns.
+            const mustSend = urgentStop === true;
+            const deadline = mustSend ? Infinity : enqueuedAt + LIMITS.ptzMaxAgeMs;
+            const lease = await acquireLease(ip, { dropSessions: true, emergency: mustSend, requireRelease: true, onvif: true,
+                waitMs: mustSend ? 1500 : Math.max(0, Math.min(5000, deadline - monotonicNow())),
+                stillWanted: () => !closed && monotonicNow() <= deadline });
             let release = null;
             leaseExpired = false;
             ptzReq       = null;
+            activeLease  = lease;
+            commandExpiresAt = deadline;
             const offExpiry = lease && lease.signal.on(() => {
                 leaseExpired = true;
                 if (ptzReq) ptzReq.destroy(new Error('PTZ lease expired'));
             });
+            let sent = false;
             try {
                 if (closed) throw new Error('PTZ node closed');
                 if (!lease && !mustSend) throw new Error(`Camera ${ip} control busy \u2014 PTZ not sent`);
@@ -166,17 +221,23 @@ module.exports = function (RED) {
                     if (!mustSend) throw err;
                 }
                 if (closed) throw new Error('PTZ node closed');
-                return await execPtzCommand(action, pan, tilt, preset);
+                return await execPtzCommand(action, pan, tilt, preset, () => { sent = true; });
+            } catch (err) {
+                if (!sent) err.notSent = true;
+                throw err;
             } finally {
                 ptzReq = null;
+                activeLease = null;
+                commandExpiresAt = Infinity;
                 if (offExpiry) offExpiry();
                 if (release) release();
                 if (lease) lease.release();
             }
         }
 
-        async function execPtzCommand(action, pan, tilt, preset) {
+        async function execPtzCommand(action, pan, tilt, preset, onSend) {
             await ensureDiscovered();
+            onSend();
 
             let xml;
 
@@ -187,6 +248,7 @@ module.exports = function (RED) {
                         `<tptz:ContinuousMove>` +
                         `<tptz:ProfileToken>${profileToken}</tptz:ProfileToken>` +
                         `<tptz:Velocity><tt:PanTilt x="${pan}" y="${tilt}"/></tptz:Velocity>` +
+                        `<tptz:Timeout>PT5S</tptz:Timeout>` +
                         `</tptz:ContinuousMove>`,
                         user, getPass(),
                     ),
@@ -275,7 +337,7 @@ module.exports = function (RED) {
 
             node.status({ fill: 'blue', shape: 'dot', text: action });
             try {
-                const result = await enqueuePtz(ip, action, () => execPtz(action, pan, tilt, preset));
+                const result = await enqueuePtz(ip, action, (enqueuedAt, urgentStop) => execPtz(action, pan, tilt, preset, enqueuedAt, urgentStop));
                 if (closed) { done(); return; }
                 if (result && result.superseded) {
                     node.status({ fill: 'grey', shape: 'dot', text: `${action} (superseded)` });

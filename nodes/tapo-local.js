@@ -1,13 +1,14 @@
 'use strict';
 
-const { executeOnDevice, COMMANDS, getDetections } = require('../lib/tapo-client');
+const { executeOnDevice, COMMANDS, getDetections, makeAbort, configureProtection, normalizeHost } = require('../lib/tapo-client');
 
 module.exports = function (RED) {
+    configureProtection(RED);
 
     // ── Config node: device registry ─────────────────────────────────────────
     function TapoDeviceNode(config) {
         RED.nodes.createNode(this, config);
-        this.ip       = config.ip;
+        this.ip       = normalizeHost(config.ip);
         this.username = config.username;
         // password stored in credentials (encrypted by Node-RED)
     }
@@ -20,6 +21,7 @@ module.exports = function (RED) {
         RED.nodes.createNode(this, config);
         const node       = this;
         const deviceNode = RED.nodes.getNode(config.device);
+        const signal = makeAbort();
 
         if (!deviceNode) {
             node.error('No Tapo device configured');
@@ -28,6 +30,7 @@ module.exports = function (RED) {
         }
 
         node.on('input', async (msg, send, done) => {
+            if (signal.aborted) { done(); return; }
             const commandKey = msg.command ?? config.command;
 
             // Special: poll recent detection events from the camera's event log
@@ -38,12 +41,15 @@ module.exports = function (RED) {
                     const events = await getDetections(
                         deviceNode.ip, deviceNode.username,
                         deviceNode.credentials.password, minutes,
+                        { signal },
                     );
+                    if (signal.aborted) { done(); return; }
                     msg.payload = { command: 'get-detections', events };
                     node.status({ fill: 'green', shape: 'dot', text: `✓ ${events.length} event(s)` });
                     send(msg);
                     done();
                 } catch (err) {
+                    if (signal.aborted) { done(); return; }
                     node.status({ fill: 'red', shape: 'ring', text: err.message.slice(0, 50) });
                     done(err);
                 }
@@ -64,7 +70,9 @@ module.exports = function (RED) {
                     deviceNode.username,
                     deviceNode.credentials.password,
                     apiCmd,
+                    { signal },
                 );
+                if (signal.aborted) { done(); return; }
                 msg.payload  = { command: commandKey, result };
                 if (result && result.superseded) {
                     node.status({ fill: 'grey', shape: 'dot', text: `${commandKey} (superseded)` });
@@ -75,12 +83,13 @@ module.exports = function (RED) {
                 send(msg);
                 done();
             } catch (err) {
+                if (signal.aborted) { done(); return; }
                 node.status({ fill: 'red', shape: 'ring', text: err.message.slice(0, 50) });
                 done(err);
             }
         });
 
-        node.on('close', () => node.status({}));
+        node.on('close', () => { signal.abort(); node.status({}); });
     }
     RED.nodes.registerType('tapo-local', TapoC225Node);
 };

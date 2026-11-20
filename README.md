@@ -9,6 +9,24 @@ Node-RED node for **local** control of Tapo C225 cameras — no cloud required
 
 ---
 
+## Reliability and HomeKit
+
+- Use the **same DHCP-reserved IP address** in every HTTPS, ONVIF and PTZ config for a camera. Hostname case, surrounding spaces and a trailing dot are normalized, but a hostname and its IP are not automatically recognized as the same camera.
+- HTTPS commands are serialized per camera, paced at least one second apart, and limited to three active/queued commands. Each command pauses ONVIF polling (aborting an in-flight pull); polling resumes half a second after it finishes. A cold session needs two login requests before its command. `QUEUE_FULL` is backpressure, not a reason to increase the queue or automatically reboot the camera.
+- PTZ commands have a separate bounded, paced queue. New movement replaces waiting movement; non-Stop commands expire after three seconds, including time spent waiting for a connection. A Stop bypasses backoff and cooldowns only within about 6.5 seconds after a move that may have reached the camera, and only once; any other Stop obeys cooldowns and pacing.
+- Continuous movement requests a **five-second camera-side timeout**. Verify timeout support on your C225 firmware before relying on it; automated tests do not establish hardware support. A timeout rejection is reported without retrying the movement without its safety timeout. Send Stop when releasing a button, and a new movement command to continue beyond five seconds.
+- Matching ONVIF event nodes share one poller and subscription per camera. Each node can start/stop its own output independently. Credentials, port, poll hold and motion timeout must match; conflicting configurations are rejected.
+- Closing/redeploying a node cancels its queued work and aborts active requests when no other caller needs them. An expired production control lease destroys its tracked requests and blocks new work until its owner confirms cleanup. If that acknowledgement is lost, it recovers after 30 seconds, but only once all tracked requests have closed.
+- Network failures use exponential backoff. Event polling and PTZ share ONVIF endpoint health; HTTPS health is separate. Invalid PTZ arguments do not block event polling; authorization, overload and server failures still trigger cooldowns. Reboot and valid Retry-After cooldowns apply to both. Recovery requires occasional probes, not continuous retries.
+- Node-RED startup has a three-second quiet period; explicit reboot commands are refused for the first 60 seconds. Cooldowns and possible subscription expiry are recorded atomically in `tapo-local-state.json` under Node-RED's user directory. **Keep that directory persistent in Docker.** The file contains deadlines and failure counts, not passwords or session keys. File-access failures are logged and protection falls back to memory.
+- After an unclean restart or a lost subscription response, polling may wait for the possible subscription to expire rather than allocate another one. The requested lifetime is 120 seconds with default settings, up to 390 seconds with the longest poll hold.
+- Completed setter results are not used to suppress later commands: HomeKit or another controller may have changed the setting. Identical queued/in-flight requests can still share work.
+
+Treat HomeKit button presses as triggers. Filter retained/initial accessory-state messages and feedback loops in the flow; the plugin cannot tell a replayed HomePod state update from an intentional command. It does not reboot cameras automatically. These protections cannot control requests sent by HomePod, other bridges or other Node-RED processes, nor prove the cause of a camera firmware restart.
+
+
+---
+
 ## Nodes
 
 ### `tapo-device` (config node — for `tapo-c225`)
@@ -136,6 +154,8 @@ Set `msg.command = 'get-detections'` and optionally `msg.minutes = 10` (default 
 
 > **Requires:** SD card inserted + local recording enabled in the Tapo app. If not present the node returns an empty events array.
 
+Concurrent queries for the same credentials and time window share work. Successful samples are reused for five seconds; accepted camera errors such as unavailable event history return an empty array and defer another query for 30 seconds. Detection results are snapshots, not a live motion feed.
+
 ---
 
 ## Adding commands
@@ -164,7 +184,7 @@ Subscribes to ONVIF WS-PullPoint events from the camera — **no `onvif` npm lib
 | Device | Select a `tapo-device` config node |
 | ONVIF port | Camera's ONVIF port (default **2020** for Tapo cameras) |
 | Action | Fixed action, or leave blank to use `msg.action` at runtime |
-| Poll hold | How long the camera holds each `PullMessages` request before returning empty (default **5 s**) |
+| Poll hold | How long the camera holds each `PullMessages` request before returning empty (default **25 s**) |
 | Motion timeout | Silence duration before emitting `detected:false` — must be longer than the camera's batch interval (~14 s on C225). Default **30 s** |
 
 ### Input
@@ -172,7 +192,7 @@ Subscribes to ONVIF WS-PullPoint events from the camera — **no `onvif` npm lib
 | `msg.action` | Description |
 |---|---|
 | `"start"` | Subscribe and begin delivering events |
-| `"stop"` | Send ONVIF `Unsubscribe` to camera and halt all requests |
+| `"stop"` | Stop this node's output; when the final subscriber stops, attempt a coordinated Unsubscribe and halt polling |
 
 ### Output `msg.payload`
 

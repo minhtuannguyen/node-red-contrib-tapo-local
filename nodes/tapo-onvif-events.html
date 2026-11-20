@@ -60,6 +60,7 @@
         defaults: {
             name:          { value: '' },
             device:        { value: '', type: 'tapo-onvif-device', required: true },
+            tapoDevice:    { value: '', type: 'tapo-device', required: false },
             onvifPort:     { value: 2020,  validate: RED.validators.number() },
             pullTimeout:   { value: 25,    validate: RED.validators.number() },
             motionTimeout: { value: 30,    validate: RED.validators.number() },
@@ -81,6 +82,15 @@
     <div class="form-row">
         <label for="node-input-device"><i class="fa fa-camera"></i> Device</label>
         <input type="text" id="node-input-device">
+    </div>
+
+    <div class="form-row">
+        <label for="node-input-tapoDevice"><i class="fa fa-lock"></i> HTTPS device</label>
+        <input type="text" id="node-input-tapoDevice">
+        <div style="font-size:0.82em;color:#888;margin-top:4px;margin-left:110px">
+            Optional <code>tapo-device</code> (same IP) used for the privacy check. Leave empty only if
+            the ONVIF and Tapo account credentials are identical.
+        </div>
     </div>
 
     <div class="form-row">

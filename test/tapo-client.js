@@ -4,6 +4,9 @@ const assert = require('assert');
 const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { EventEmitter } = require('events');
 const { performance } = require('perf_hooks');
 
@@ -124,7 +127,7 @@ function fixture() {
 
     delete require.cache[clientPath];
     const client = require(clientPath);
-    Object.assign(client._limits, { minGapMs: 0, leaseGraceMs: 10, opMaxMs: 2000 });
+    Object.assign(client._limits, { minGapMs: 0, leaseGraceMs: 10, opMaxMs: 2000, startupQuietMs: 0 });
     const ip = 'mock-camera';
     const send = command => client.executeOnDevice(ip, 'test-user', password, command);
     return { client, camera, ip, send };
@@ -151,7 +154,7 @@ async function waitFor(predicate, ms = 3000) {
 
 // Real event node against scripted ONVIF requests.  `script[op](request)` returns XML, { status, body },
 // HOLD (connected, no reply) or undefined (still connecting); unlisted operations use ONVIF_DEFAULTS.
-async function eventFixture({ script = {}, leases = 'real', leaseHoldMs, autoStart = false, privacy = 'off' } = {}) {
+async function eventFixture({ script = {}, leases = 'real', leaseHoldMs, autoStart = false, privacy = 'off', eventConfig = {}, beforeNode, onvifDevice } = {}) {
     const base = fixture();
     base.camera.privacy = privacy;
     const originalHttpRequest = http.request;
@@ -161,6 +164,7 @@ async function eventFixture({ script = {}, leases = 'real', leaseHoldMs, autoSta
     const leaseLog = [];
     const statuses = [];
     const warns = [];
+    const messages = [];
     const realAcquire = base.client.acquireLease;
     let acquireCalls = 0;
     let expiredLease = null;
@@ -224,6 +228,7 @@ async function eventFixture({ script = {}, leases = 'real', leaseHoldMs, autoSta
         ? soapRequest(options, callback) : cameraRequest(options, callback);
     const types = {};
     const device = { ip: base.ip, username: 'test-user', credentials: { password } };
+    const eventDevice = onvifDevice ? { ip: base.ip, ...onvifDevice } : device;
     const RED = { nodes: {
         createNode(node) {
             const emitter = new EventEmitter();
@@ -232,19 +237,22 @@ async function eventFixture({ script = {}, leases = 'real', leaseHoldMs, autoSta
             node.status = status => statuses.push(status.text);
             node.warn = message => warns.push(String(message));
             node.error = () => {};
-            node.send = () => {};
+            node.send = message => messages.push(message);
         },
-        getNode: () => device,
+        getNode: id => id === 'test-https-device' || !onvifDevice ? device : eventDevice,
         registerType: (name, constructor) => { types[name] = constructor; },
     } };
     const eventPath = require.resolve('../nodes/tapo-onvif-events');
     delete require.cache[eventPath];
     require(eventPath)(RED);
-    const node = new types['tapo-onvif-events']({ device: 'test-device', autoStart });
+    if (beforeNode) await beforeNode(base);
+    const node = new types['tapo-onvif-events']({ device: 'test-device', autoStart, ...eventConfig });
+    const eventNodes = [node];
     const input = action => node.emit('input', { action }, () => {}, () => {});
     const ops = () => seen.map(request => request.op);
     const ptzPath = require.resolve('../nodes/tapo-ptz');
     const ptzNodes = [];
+    const controlNodes = [];
     function createPtz() {
         if (!types['tapo-ptz']) {
             delete require.cache[ptzPath];
@@ -259,13 +267,30 @@ async function eventFixture({ script = {}, leases = 'real', leaseHoldMs, autoSta
             close: () => ptz.emit('close'),
         };
     }
-    return { ...base, node, input, created, seen, ops, leaseLog, statuses, warns, realAcquire,
+    return { ...base, node, input, created, seen, ops, leaseLog, statuses, warns, messages, realAcquire,
+        createControl() {
+            const controlPath = require.resolve('../nodes/tapo-local');
+            delete require.cache[controlPath];
+            require(controlPath)(RED);
+            const control = new types['tapo-local']({ device: 'test-device' });
+            controlNodes.push(control);
+            return {
+                send: command => new Promise(resolve => control.emit('input', { command }, message => messages.push(message), resolve)),
+                close: () => control.emit('close'),
+            };
+        },
+        createEvents(config = {}) {
+            const added = new types['tapo-onvif-events']({ device: 'test-device', autoStart: true, ...config });
+            eventNodes.push(added);
+            return added;
+        },
         createPtz,
         acquireCalls: () => acquireCalls,
         async close() {
             try {
                 for (const ptz of ptzNodes) ptz.emit('close');
-                await new Promise(resolve => node.emit('close', false, resolve));
+                for (const control of controlNodes) control.emit('close');
+                for (const eventNode of eventNodes) await new Promise(resolve => eventNode.emit('close', false, resolve));
             }
             finally {
                 http.request = originalHttpRequest;
@@ -276,6 +301,369 @@ async function eventFixture({ script = {}, leases = 'real', leaseHoldMs, autoSta
         },
     };
 }
+
+tests.push(['event handoff is released when a request fails before tracking', async () => {
+    const events = await eventFixture({ script: {
+        GetCapabilities: () => '<Events><XAddr>http://[</XAddr></Events>',
+    } });
+    try {
+        events.input('start');
+        await waitFor(() => events.warns.some(message => /Bad ONVIF URL/.test(message)));
+        const lease = await events.realAcquire(events.ip, { waitMs: 100 });
+        assert(lease, 'a failed request must not leave the camera quarantined');
+        lease.release();
+        assert(events.leaseLog.every(entry => !entry.signal.aborted), 'handoff must release before expiry');
+    } finally { await events.close(); }
+}]);
+
+tests.push(['lease predicate exceptions settle without wedging the caller', async () => {
+    const { client, ip } = fixture();
+    const result = await Promise.race([
+        client.acquireLease(ip, { stillWanted: () => { throw new Error('owner removed'); } }),
+        delay(100).then(() => 'unsettled'),
+    ]);
+    assert.strictEqual(result, null);
+    const lease = await client.acquireLease(ip, { waitMs: 100 });
+    assert(lease);
+    lease.release();
+}]);
+
+tests.push(['timed-out lease waiters free admission capacity immediately', async () => {
+    const { client, ip } = fixture();
+    client._limits.maxLeases = 2;
+    const blocker = await client.acquireLease(ip);
+    try {
+        assert.strictEqual(await client.acquireLease(ip, { waitMs: 10 }), null);
+        const pending = client.acquireLease(ip, { waitMs: 100 });
+        blocker.release();
+        const lease = await pending;
+        assert(lease, 'an abandoned waiter must not occupy a lease slot');
+        lease.release();
+    } finally { blocker.release(); }
+}]);
+
+tests.push(['cancelled queue owners send no traffic and free capacity', async () => {
+    const { client, camera, ip, send } = fixture();
+    const lease = await client.acquireLease(ip);
+    const signal = client.makeAbort();
+    const pending = client.executeOnDevice(ip, 'test-user', password, client.COMMANDS['led-on'], { signal });
+    const rejected = assert.rejects(pending, error => error.code === 'CANCELLED');
+    signal.abort();
+    await rejected;
+    const next = send(client.COMMANDS['get-device-info']);
+    lease.release();
+    await next;
+    assert.deepStrictEqual(camera.commands, ['getDeviceInfo']);
+}]);
+
+tests.push(['cancelling one shared read preserves the other live owner', async () => {
+    const { client, camera, ip, send } = fixture();
+    const lease = await client.acquireLease(ip);
+    const signal = client.makeAbort();
+    const first = client.executeOnDevice(ip, 'test-user', password, client.COMMANDS['get-device-info'], { signal });
+    const second = send(client.COMMANDS['get-device-info']);
+    const rejected = assert.rejects(first, error => error.code === 'CANCELLED');
+    signal.abort();
+    lease.release();
+    await Promise.all([rejected, second]);
+    assert.deepStrictEqual(camera.commands, ['getDeviceInfo']);
+}]);
+
+tests.push(['unconfirmed setters are not cached as successful repeats', async () => {
+    const { client, camera, send } = fixture();
+    camera.onCommand = async () => { throw Object.assign(new Error('lost reply'), { code: 'ECONNRESET' }); };
+    const command = { ...client.COMMANDS['led-on'], _acceptNetworkErrors: true };
+    assert.strictEqual((await send(command)).confirmed, false);
+    await assert.rejects(send(command), error => error.code === 'BACKOFF');
+    assert.deepStrictEqual(camera.commands, ['setLedStatus']);
+}]);
+
+tests.push(['multiple event nodes share one subscription and stop independently', async () => {
+    const events = await eventFixture({ autoStart: true });
+    try {
+        const second = events.createEvents();
+        await waitFor(() => events.ops().includes('PullMessages'));
+        await new Promise(resolve => second.emit('input', { action: 'stop' }, null, resolve));
+        assert.strictEqual(events.ops().filter(op => op === 'CreatePullPointSubscription').length, 1);
+        assert(!events.ops().includes('Unsubscribe'), 'stopping one subscriber must not stop another');
+        await new Promise(resolve => events.node.emit('input', { action: 'stop' }, null, resolve));
+        assert.strictEqual(events.ops().filter(op => op === 'Unsubscribe').length, 1);
+    } finally { await events.close(); }
+}]);
+
+tests.push(['PTZ flood replaces waiting moves without replaying the backlog', async () => {
+    let firstMove;
+    const events = await eventFixture({ script: { ContinuousMove: request => {
+        if (!firstMove) { firstMove = request; return HOLD; }
+        return ONVIF_DEFAULTS.ContinuousMove;
+    } } });
+    events.client._limits.ptzGapMs = 10;
+    const ptz = events.createPtz();
+    const running = ptz.send('continuousMove');
+    try {
+        await waitFor(() => firstMove);
+        const flood = Array.from({ length: 200 }, () => ptz.send('continuousMove'));
+        firstMove.destroy(new Error('cancel test move'));
+        await Promise.all([running, ...flood]);
+        assert.strictEqual(events.ops().filter(op => op === 'ContinuousMove').length, 2);
+        assert(/<tptz:Timeout>PT5S<\/tptz:Timeout>/.test(firstMove.body));
+    } finally { await events.close(); }
+}]);
+
+tests.push(['PTZ Stop bypasses movement pacing', async () => {
+    const events = await eventFixture();
+    const ptz = events.createPtz();
+    try {
+        events.client._limits.ptzGapMs = 2000;
+        await ptz.send('continuousMove');
+        const started = performance.now();
+        await ptz.send('stop');
+        assert(performance.now() - started < 500);
+        assert(events.ops().includes('Stop'));
+    } finally { await events.close(); }
+}]);
+
+for (const reason of ['Invalid preset token', 'Unsupported timeout argument']) {
+    tests.push([`PTZ command fault (${reason}) does not trigger a device cooldown`, async () => {
+        let moves = 0;
+        const events = await eventFixture({ script: { ContinuousMove: () => ++moves === 1
+            ? `<s:Fault><s:Reason>${reason}</s:Reason></s:Fault>` : ONVIF_DEFAULTS.ContinuousMove } });
+        const ptz = events.createPtz();
+        events.client._limits.ptzGapMs = 0;
+        try {
+            assert((await ptz.send('continuousMove')) instanceof Error);
+            assert.strictEqual(moves, 1, 'a rejected move must not be replayed automatically');
+            assert.strictEqual(events.client.onvifDelayMs(events.ip), 0);
+            assert.strictEqual(await ptz.send('continuousMove'), undefined);
+            assert.strictEqual(moves, 2);
+        } finally { await events.close(); }
+    }]);
+}
+
+for (const reply of [
+    { status: 401 }, { status: 403 }, { status: 429 }, { status: 500 }, { status: 503 },
+    '<s:Fault><s:Subcode>ter:NotAuthorized</s:Subcode></s:Fault>',
+]) {
+    tests.push([`PTZ health failure (${reply.status || 'NotAuthorized'}) still triggers a cooldown`, async () => {
+        const events = await eventFixture({ script: { ContinuousMove: () => reply } });
+        const ptz = events.createPtz();
+        try {
+            assert((await ptz.send('continuousMove')) instanceof Error);
+            assert(events.client.onvifDelayMs(events.ip) > 0);
+            const sent = events.seen.length;
+            assert((await ptz.send('continuousMove')) instanceof Error);
+            assert.strictEqual(events.seen.length, sent, 'cooldown must prevent another camera request');
+        } finally { await events.close(); }
+    }]);
+}
+
+tests.push(['reboot cooldown blocks ordinary ONVIF leases', async () => {
+    const { client, ip, send } = fixture();
+    client._limits.startupRebootGuardMs = 0;
+    await send(client.COMMANDS.reboot);
+    assert(client.controlDelayMs(ip) > 40000);
+    assert.strictEqual(await client.acquireLease(ip), null);
+}]);
+
+tests.push(['expired production leases quarantine unacknowledged owners', async () => {
+    const { client, ip, send, camera } = fixture();
+    const lease = await client.acquireLease(ip, { holdMs: 10, requireRelease: true });
+    await delay(40);
+    try {
+        assert.strictEqual(await client.acquireLease(ip, { waitMs: 50 }), null);
+        await assert.rejects(send(client.COMMANDS['led-on']), error => error.code === 'ONVIF_PAUSE');
+        assert.deepStrictEqual(camera.requests, []);
+    } finally { lease.release(); }
+    await send(client.COMMANDS['led-on']);
+    assert.deepStrictEqual(camera.commands, ['setLedStatus']);
+}]);
+
+tests.push(['abandoned idle leases recover without an owner acknowledgement', async () => {
+    const { client, ip, send } = fixture();
+    client._limits.leaseRecoveryMs = 30;
+    const abandoned = await client.acquireLease(ip, { holdMs: 10, requireRelease: true });
+    await delay(80);
+    const next = await client.acquireLease(ip, { requireRelease: true, holdMs: 200 });
+    assert(next, 'an abandoned idle owner must not block control permanently');
+    abandoned.release();
+    next.release();
+    await send(client.COMMANDS['led-on']);
+}]);
+
+tests.push(['lease recovery waits for socket close and rejects late requests', async () => {
+    const { client, ip, send, camera } = fixture();
+    client._limits.leaseRecoveryMs = 20;
+    const lease = await client.acquireLease(ip, { holdMs: 10, requireRelease: true });
+    const request = new EventEmitter();
+    let destroyed = false;
+    request.destroy = () => { destroyed = true; };
+    lease.trackRequest(request);
+    try {
+        await delay(70);
+        assert(destroyed, 'expired leases must destroy tracked requests');
+        assert.strictEqual(await client.acquireLease(ip), null);
+        await assert.rejects(send(client.COMMANDS['led-on']), error => error.code === 'ONVIF_PAUSE');
+        assert.deepStrictEqual(camera.requests, []);
+        request.emit('close');
+        assert.strictEqual(request.listenerCount('close'), 0);
+        await send(client.COMMANDS['led-on']);
+        let lateDestroyed = false;
+        lease.trackRequest({ destroy: () => { lateDestroyed = true; } });
+        assert(lateDestroyed, 'an expired owner cannot open another connection');
+    } finally { lease.release(); }
+}]);
+
+tests.push(['reboot and subscription protection survive a fresh client instance', async () => {
+    const userDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tapo-state-'));
+    try {
+        const first = fixture();
+        first.client.configureProtection({ settings: { userDir } });
+        first.client._limits.startupRebootGuardMs = 0;
+        first.client.reserveSubscription(first.ip, 120000);
+        await first.send(first.client.COMMANDS.reboot);
+        first.client.noteOnvifFailure(first.ip, new Error('ECONNREFUSED'));
+        const second = fixture();
+        second.client.configureProtection({ settings: { userDir } });
+        await assert.rejects(second.send(second.client.COMMANDS['led-on']), error => error.code === 'BACKOFF');
+        assert.strictEqual(await second.client.acquireLease(second.ip), null);
+        assert(second.client.subscriptionDelayMs(second.ip) > 119000);
+        assert(second.client.onvifDelayMs(second.ip) > 2000);
+        assert.deepStrictEqual(second.camera.requests, []);
+        const saved = fs.readFileSync(path.join(userDir, 'tapo-local-state.json'), 'utf8');
+        assert(!saved.includes(password));
+        assert(!saved.includes(digest(password)));
+    } finally { fs.rmSync(userDir, { recursive: true, force: true }); }
+}]);
+
+tests.push(['privacy-on cancels a poller lease queued behind its own command', async () => {
+    const events = await eventFixture();
+    events.client._limits.onvifStopMs = 1200;
+    const blocker = await events.realAcquire(events.ip);
+    const privacy = events.send(events.client.COMMANDS['privacy-on']);
+    try {
+        events.input('start');
+        await waitFor(() => events.acquireCalls() === 1);
+        blocker.release();
+        await privacy;
+        assert.deepStrictEqual(events.camera.commands, ['setLensMaskConfig']);
+        assert.deepStrictEqual(events.ops(), []);
+    } finally { blocker.release(); await privacy.catch(() => {}); await events.close(); }
+}]);
+
+tests.push(['ONVIF backoff prevents both event and PTZ probes without blocking healthy HTTPS', async () => {
+    const events = await eventFixture();
+    try {
+        events.client.noteOnvifFailure(events.ip, new Error('ECONNREFUSED'));
+        events.input('start');
+        const ptz = events.createPtz();
+        const error = await ptz.send('continuousMove');
+        assert(error instanceof Error);
+        await events.send(events.client.COMMANDS['get-device-info']);
+        await delay(50);
+        assert.deepStrictEqual(events.ops(), []);
+        assert.deepStrictEqual(events.camera.commands, ['getDeviceInfo']);
+    } finally { await events.close(); }
+}]);
+
+tests.push(['hostname spelling variants share the same camera queue', async () => {
+    const { client, camera, ip } = fixture();
+    const blocker = await client.acquireLease(ip);
+    const pending = client.executeOnDevice(' MOCK-CAMERA. ', 'test-user', password, client.COMMANDS['led-on']);
+    await delay(20);
+    assert.deepStrictEqual(camera.requests, []);
+    blocker.release();
+    await pending;
+    assert.deepStrictEqual(camera.commands, ['setLedStatus']);
+}]);
+
+tests.push(['PTZ commands expire while waiting for the HTTPS lease', async () => {
+    const events = await eventFixture();
+    events.client._limits.ptzMaxAgeMs = 40;
+    const blocker = await events.realAcquire(events.ip);
+    const ptz = events.createPtz();
+    try {
+        const error = await ptz.send('continuousMove');
+        assert(error instanceof Error);
+        assert.deepStrictEqual(events.ops(), []);
+    } finally { blocker.release(); await events.close(); }
+}]);
+
+tests.push(['repeated PTZ Stops remain paced', async () => {
+    const events = await eventFixture();
+    events.client._limits.ptzGapMs = 80;
+    const ptz = events.createPtz();
+    try {
+        await ptz.send('stop');
+        const started = performance.now();
+        await ptz.send('stop');
+        assert(performance.now() - started >= 60);
+        assert.strictEqual(events.ops().filter(op => op === 'Stop').length, 2);
+    } finally { await events.close(); }
+}]);
+
+tests.push(['public authenticated senders obey the shared queue and circuit breaker', async () => {
+    const { client, camera, ip, send } = fixture();
+    const session = await client.authenticate(ip, 'test-user', password);
+    try {
+        const blocker = await client.acquireLease(ip);
+        const pending = session.sendCmd(client.COMMANDS['led-on']);
+        await delay(20);
+        assert.deepStrictEqual(camera.requests, ['login', 'login']);
+        blocker.release();
+        await pending;
+        camera.onCommand = async () => ({ status: 503, raw: { error_code: 0 } });
+        await assert.rejects(send(client.COMMANDS['get-device-info']));
+        const before = camera.requests.length;
+        await assert.rejects(session.sendCmd(client.COMMANDS['led-off']), error => error.code === 'BACKOFF');
+        await assert.rejects(client.authenticate(ip, 'test-user', password), error => error.code === 'BACKOFF');
+        assert.strictEqual(camera.requests.length, before);
+    } finally { session.agent.destroy(); }
+}]);
+
+tests.push(['new callers do not inherit cancellation from an abandoned running read', async () => {
+    const { client, camera, ip, send } = fixture();
+    const started = deferred();
+    const finish = deferred();
+    camera.onCommand = async () => {
+        if (camera.commands.length === 1) { started.resolve(); await finish.promise; }
+        return {};
+    };
+    const signal = client.makeAbort();
+    const first = client.executeOnDevice(ip, 'test-user', password, client.COMMANDS['get-device-info'], { signal });
+    const cancelled = assert.rejects(first, error => error.code === 'CANCELLED');
+    try {
+        await started.promise;
+        signal.abort();
+        const second = send(client.COMMANDS['get-device-info']);
+        await Promise.all([cancelled, second]);
+        assert.deepStrictEqual(camera.commands, ['getDeviceInfo', 'getDeviceInfo']);
+    } finally { finish.resolve(); }
+}]);
+
+tests.push(['closing a control node cancels queued commands and emits no output', async () => {
+    const events = await eventFixture();
+    const blocker = await events.realAcquire(events.ip);
+    const control = events.createControl();
+    try {
+        const pending = control.send('led-on');
+        control.close();
+        blocker.release();
+        await pending;
+        assert.deepStrictEqual(events.camera.requests, []);
+        assert.deepStrictEqual(events.messages, []);
+    } finally { blocker.release(); await events.close(); }
+}]);
+
+tests.push(['changing camera usernames destroys the previous session agent', async () => {
+    const { client, ip } = fixture();
+    const first = await client.authenticate(ip, 'test-user', password);
+    let destroyed = false;
+    const originalDestroy = first.agent.destroy.bind(first.agent);
+    first.agent.destroy = () => { destroyed = true; originalDestroy(); };
+    const second = await client.authenticate(ip, 'other-user', password);
+    assert(destroyed);
+    second.agent.destroy();
+}]);
 
 tests.push(['all catalogue setters explicitly declare complete-state coalescing', async () => {
     const { client } = fixture();
@@ -323,7 +711,7 @@ tests.push(['TLS handoff stays protected after TCP connect until secureConnect',
         await queued;
         assert.strictEqual(lease.signal.fns.size, 0);
         assert.strictEqual(lease.signal.aborted, false);
-        assert.strictEqual(request.destroyed, false);
+        assert.strictEqual(request.destroyed, true, 'the HTTPS command pauses the connected ONVIF request');
     } finally { await events.close(); }
 }]);
 
@@ -487,6 +875,52 @@ tests.push(['confirmed privacy-on at startup takes no lease and sends no ONVIF t
         await delay(100);
         assert.strictEqual(events.acquireCalls(), 0);
         assert.strictEqual(events.created.length, 0);
+    } finally { await events.close(); }
+}]);
+
+tests.push(['stopping startup cancels the queued privacy query', async () => {
+    let blocker;
+    const events = await eventFixture({ autoStart: true, beforeNode: async base => {
+        blocker = await base.client.acquireLease(base.ip);
+    } });
+    try {
+        await new Promise(resolve => events.node.emit('input', { action: 'stop' }, null, resolve));
+        blocker.release();
+        await delay(50);
+        assert.deepStrictEqual(events.camera.requests, []);
+        assert.deepStrictEqual(events.ops(), []);
+    } finally { blocker.release(); await events.close(); }
+}]);
+
+tests.push(['SOAP transport settles real HTTP responses, tracking errors and overloads', async () => {
+    const { soapPost } = require('../lib/onvif-soap');
+    const server = http.createServer((request, response) => {
+        request.resume();
+        if (request.url === '/overload') {
+            response.writeHead(503, { 'Retry-After': '120' });
+            response.end('<Fault>busy</Fault>');
+        } else response.end('<PullMessagesResponse/>');
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${server.address().port}`;
+    try {
+        assert.strictEqual(await soapPost(url + '/ok', '<Envelope/>', 1000), '<PullMessagesResponse/>');
+        await assert.rejects(soapPost(url + '/overload', '<Envelope/>', 1000),
+            error => error.httpStatus === 503 && error.retryAfterMs === 120000);
+        await assert.rejects(soapPost(url + '/track-error', '<Envelope/>', 1000, () => { throw new Error('tracking failed'); }),
+            /tracking failed/);
+    } finally { await new Promise(resolve => server.close(resolve)); }
+}]);
+
+tests.push(['transient subscription SOAP faults retain the existing pull-point', async () => {
+    let pulls = 0;
+    const events = await eventFixture({ script: { PullMessages: () => (++pulls === 1
+        ? '<s:Fault><s:Reason>temporarily busy</s:Reason></s:Fault>' : HOLD) } });
+    try {
+        events.input('start');
+        await waitFor(() => pulls === 2, 9000);
+        assert.strictEqual(events.ops().filter(op => op === 'CreatePullPointSubscription').length, 1);
+        assert(events.ops().includes('Renew'));
     } finally { await events.close(); }
 }]);
 
@@ -655,8 +1089,9 @@ for (const barrier of ['action', 'lease']) {
     }
 }
 
-tests.push(['identical setters still share running and recent results without a barrier', async () => {
+tests.push(['identical setters share running and opt-in recent results without a barrier', async () => {
     const { client, camera, send } = fixture();
+    client._limits.repeatWindowMs = 3000;
     const started = deferred();
     const finish = deferred();
     camera.onCommand = async () => { started.resolve(); await finish.promise; return {}; };
@@ -667,6 +1102,67 @@ tests.push(['identical setters still share running and recent results without a 
     await Promise.all([first, second]);
     await send(client.COMMANDS['led-on']);
     assert.deepStrictEqual(camera.commands, ['setLedStatus']);
+}]);
+
+tests.push(['completed setters are resent after an external controller changes the state', async () => {
+    const { client, camera, send } = fixture();
+    assert.strictEqual(client._limits.repeatWindowMs, 0);
+    await send(client.COMMANDS['led-on']);
+    camera.setting = 'off';
+    await send(client.COMMANDS['led-on']);
+    assert.deepStrictEqual(camera.commands, ['setLedStatus', 'setLedStatus']);
+    assert.strictEqual(camera.setting, 'on');
+}]);
+
+tests.push(['detection polling shares concurrent and recent samples', async () => {
+    const { client, camera, ip } = fixture();
+    const poll = () => client.getDetections(ip, 'test-user', password, 5);
+    await Promise.all(Array.from({ length: 20 }, poll));
+    await poll();
+    assert.deepStrictEqual(camera.commands, ['searchDetectionList']);
+}]);
+
+for (const source of ['external', 'command']) {
+    tests.push([`${source} privacy clears active motion exactly once`, async () => withMonotonicClock(async shift => {
+        let pulls = 0;
+        const events = await eventFixture({ script: { PullMessages: () => {
+            if (++pulls > 1) return HOLD;
+            return '<PullMessagesResponse>' + ['Motion', 'Person'].map(topic =>
+                `<NotificationMessage><Topic>${topic}</Topic>`
+                + '<Message><tt:Message PropertyOperation="Changed"><Data>'
+                + '<SimpleItem Name="Detected" Value="true"/>'
+                + '</Data></tt:Message></Message></NotificationMessage>').join('') + '</PullMessagesResponse>';
+        } } });
+        try {
+            events.input('start');
+            await waitFor(() => events.messages.length === 2);
+            if (source === 'external') {
+                events.camera.privacy = 'on';
+                shift(301000);
+            } else await events.send(events.client.COMMANDS['privacy-on']);
+            await waitFor(() => events.messages.length === 4);
+            assert.deepStrictEqual(events.messages.map(message => message.payload.detected), [true, true, false, false]);
+            assert.deepStrictEqual(events.messages.slice(2).map(message => message.payload.property), ['privacy', 'privacy']);
+            assert.strictEqual(pulls, 1, 'privacy must stop event polling');
+        } finally { await events.close(); }
+    })]);
+}
+
+tests.push(['false Initialized events do not prolong an active motion watchdog', async () => {
+    let pulls = 0;
+    const events = await eventFixture({ eventConfig: { motionTimeout: 1 }, script: { PullMessages: () => {
+        if (++pulls > 2) return HOLD;
+        return '<PullMessagesResponse><NotificationMessage><Topic>Motion</Topic>'
+            + '<Message><tt:Message PropertyOperation="Initialized"><Data>'
+            + `<SimpleItem Name="IsMotion" Value="${pulls === 1}"/>`
+            + '</Data></tt:Message></Message></NotificationMessage></PullMessagesResponse>';
+    } } });
+    try {
+        events.input('start');
+        await waitFor(() => events.messages.some(message => message.payload.detected), 3000);
+        await waitFor(() => events.messages.some(message => message.payload.detected === false), 1800);
+        assert.deepStrictEqual(events.messages.map(message => message.payload.detected), [true, false]);
+    } finally { await events.close(); }
 }]);
 
 for (const status of [429, 503]) {
@@ -858,6 +1354,77 @@ tests.push(['expiry during authentication survives a backward clock jump', async
     assert.deepStrictEqual(camera.requests, ['login', 'login']);
     assert.deepStrictEqual(camera.commands, []);
 })]);
+
+tests.push(['HTTPS commands pause the ONVIF pull and polling resumes afterwards', async () => {
+    const events = await eventFixture({ autoStart: true });
+    events.client._limits.httpsResumeMs = 50;
+    try {
+        await waitFor(() => events.ops().includes('PullMessages'));
+        const pull = events.seen.find(request => request.op === 'PullMessages');
+        let pausedAtCommand;
+        events.camera.onCommand = async () => { pausedAtCommand = pull.destroyed; return {}; };
+        await events.send(events.client.COMMANDS['led-on']);
+        assert.strictEqual(pausedAtCommand, true);
+        await waitFor(() => events.ops().filter(op => op === 'PullMessages').length >= 2);
+    } finally { await events.close(); }
+}]);
+
+tests.push(['PTZ Stop without a recent move respects the reboot cooldown', async () => {
+    const events = await eventFixture();
+    try {
+        events.client._limits.startupRebootGuardMs = 0;
+        await events.send(events.client.COMMANDS.reboot);
+        const ptz = events.createPtz();
+        assert((await ptz.send('stop')) instanceof Error);
+        assert.deepStrictEqual(events.ops(), []);
+    } finally { await events.close(); }
+}]);
+
+tests.push(['PTZ Stop after a delivered move is sent once despite a cooldown', async () => {
+    const events = await eventFixture();
+    try {
+        events.client._limits.startupRebootGuardMs = 0;
+        events.client._limits.ptzGapMs = 10;
+        const ptz = events.createPtz();
+        await ptz.send('continuousMove');
+        await events.send(events.client.COMMANDS.reboot);
+        assert.strictEqual(await ptz.send('stop'), undefined);
+        assert((await ptz.send('stop')) instanceof Error);
+        assert.strictEqual(events.ops().filter(op => op === 'Stop').length, 1);
+    } finally { await events.close(); }
+}]);
+
+tests.push(['an undelivered move does not open the urgent Stop window', async () => {
+    const events = await eventFixture();
+    try {
+        events.client._limits.ptzMaxAgeMs = 40;
+        const blocker = await events.realAcquire(events.ip);
+        const ptz = events.createPtz();
+        try { assert((await ptz.send('continuousMove')) instanceof Error); } finally { blocker.release(); }
+        events.client._limits.startupRebootGuardMs = 0;
+        await events.send(events.client.COMMANDS.reboot);
+        assert((await ptz.send('stop')) instanceof Error);
+        assert.deepStrictEqual(events.ops(), []);
+    } finally { await events.close(); }
+}]);
+
+const separateAccounts = { username: 'onvif-user', credentials: { password: 'separate-onvif-password' } };
+
+tests.push(['event privacy guard uses the configured HTTPS device credentials', async () => {
+    const events = await eventFixture({ autoStart: true, onvifDevice: separateAccounts, eventConfig: { tapoDevice: 'test-https-device' } });
+    try {
+        await waitFor(() => events.ops().includes('CreatePullPointSubscription'));
+        assert(!events.warns.some(message => /Privacy check failed/.test(message)));
+    } finally { await events.close(); }
+}]);
+
+tests.push(['event privacy guard falls back to the ONVIF credentials without an HTTPS device', async () => {
+    const events = await eventFixture({ autoStart: true, onvifDevice: separateAccounts });
+    try {
+        await waitFor(() => events.warns.some(message => /Privacy check failed/.test(message)));
+        assert(!events.ops().includes('CreatePullPointSubscription'));
+    } finally { await events.close(); }
+}]);
 
 (async () => {
     let failures = 0;
