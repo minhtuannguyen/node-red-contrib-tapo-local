@@ -110,12 +110,20 @@ module.exports = function (RED) {
         const profileToken = escXml(config.profileToken || 'MediaProfile000');
         let ptzUrl         = null;   // PTZ service XAddr from GetCapabilities
 
+        // Aborts the in-flight SOAP request once the lease has expired, so PTZ never overlaps HTTPS work.
+        let ptzReq = null, leaseExpired = false;
+        const trackReq = req => {
+            if (leaseExpired) req.destroy(new Error('PTZ lease expired'));
+            else ptzReq = req;
+        };
+
         // ── Service discovery ─────────────────────────────────────────────────
         async function discoverServices() {
             const xml = await soapPost(
                 deviceUrl,
                 soapEnvelope('<tds:GetCapabilities><tds:Category>All</tds:Category></tds:GetCapabilities>', user, getPass()),
                 8000,
+                trackReq,
             );
             if (/[Ff]ault/.test(xml)) throw new Error('GetCapabilities SOAP fault: ' + xml.slice(0, 300));
             // Extract PTZ XAddr (inside <PTZ> element)
@@ -136,6 +144,12 @@ module.exports = function (RED) {
             const lease = await acquireLease(ip, { waitMs: mustSend ? 1500 : 5000 });
             if (!lease && !mustSend) throw new Error(`Camera ${ip} control busy \u2014 PTZ not sent`);
             let release = null;
+            leaseExpired = false;
+            ptzReq       = null;
+            const offExpiry = lease && lease.signal.on(() => {
+                leaseExpired = true;
+                if (ptzReq) ptzReq.destroy(new Error('PTZ lease expired'));
+            });
             try {
                 // Pause tapo-onvif-events (aborting its in-flight PullMessages) so the
                 // camera's connection slot is free for PTZ; resume when done.
@@ -146,6 +160,7 @@ module.exports = function (RED) {
                 }
                 return await execPtzCommand(action, pan, tilt, preset);
             } finally {
+                if (offExpiry) offExpiry();
                 if (release) release();
                 if (lease) lease.release();
             }
@@ -167,6 +182,7 @@ module.exports = function (RED) {
                         user, getPass(),
                     ),
                     8000,
+                    trackReq,
                 );
 
             } else if (action === 'stop') {
@@ -181,6 +197,7 @@ module.exports = function (RED) {
                         user, getPass(),
                     ),
                     8000,
+                    trackReq,
                 );
 
             } else if (action === 'gotoPreset') {
@@ -195,6 +212,7 @@ module.exports = function (RED) {
                         user, getPass(),
                     ),
                     8000,
+                    trackReq,
                 );
 
             } else if (action === 'getPresets') {
@@ -207,6 +225,7 @@ module.exports = function (RED) {
                         user, getPass(),
                     ),
                     8000,
+                    trackReq,
                 );
                 if (/[Ff]ault/.test(xml)) throw new Error('GetPresets SOAP fault: ' + xml.slice(0, 300));
                 return xmlFindAll(xml, 'Preset').map(p => ({

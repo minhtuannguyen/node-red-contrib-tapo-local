@@ -184,14 +184,40 @@ module.exports = function (RED) {
         const PULL_MIN_INTERVAL_MS = 1000;   // never spin if the camera answers PullMessages instantly
         const PTZ_GRACE_MS         = 3000;   // keep the slot free briefly: a Stop usually follows a move
         const PTZ_HOLD_MAX_MS      = 30000;  // safety: never pause polling forever
-        const HANDOFF_MS           = 1500;   // HTTPS commands wait this long while ONVIF connects
+        const HANDOFF_MAX_MS       = 5000;   // HTTPS commands wait at most this long for ONVIF to connect
+        let   handoffLease         = null;   // held until the next ONVIF request has connected
 
-        // Close idle HTTPS sockets and keep HTTPS commands queued briefly, so the next ONVIF
-        // request does not compete with an HTTPS login.
+        // Close idle HTTPS sockets and keep HTTPS commands queued until the next ONVIF
+        // request has actually connected (track() releases it), so the two don't overlap.
         async function handoff() {
-            const lease = await acquireLease(ip, { dropSessions: true });
+            const lease = await acquireLease(ip, { dropSessions: true, holdMs: HANDOFF_MAX_MS });
             if (!lease) { node.warn('HTTPS queue busy — ONVIF continuing without hand-off'); return; }
-            setTimeout(lease.release, HANDOFF_MS);
+            if (handoffLease) handoffLease.release();
+            handoffLease = lease;
+        }
+
+        function releaseOnConnect(req) {
+            const lease = handoffLease;
+            if (!lease) return;
+            handoffLease = null;
+            let offExpiry = null, socket = null, connectEvent = null, released = false;
+            const release = () => {
+                if (released) return;
+                released = true;
+                if (offExpiry) offExpiry();
+                if (socket && connectEvent) socket.removeListener(connectEvent, release);
+                lease.release();
+            };
+            req.once('close', release);
+            req.once('error', () => { if (!lease.signal.aborted) release(); });
+            offExpiry = lease.signal.on(reason => req.destroy(reason));
+            req.once('socket', connectedSocket => {
+                if (req.destroyed || lease.signal.aborted) return;
+                socket = connectedSocket;
+                connectEvent = socket.encrypted ? 'secureConnect' : 'connect';
+                if (socket.connecting || (socket.encrypted && !req.reusedSocket)) socket.once(connectEvent, release);
+                else release();
+            });
         }
 
         // Per-topic motion-detection state (reset on stop)
@@ -310,7 +336,7 @@ module.exports = function (RED) {
         // which exhausts the C225's subscription table and crashes it.
         async function pollLoop(ctx, privacyKnownOff) {
             const alive = () => !ctx.stopped && !closed;
-            const track = req => { ctx.req = req; };
+            const track = req => { ctx.req = req; releaseOnConnect(req); };
             let failures         = 0;
             let needPrivacyCheck = !privacyKnownOff;
             let renewAt          = 0;
@@ -587,6 +613,7 @@ module.exports = function (RED) {
         node.on('close', (removed, done) => {
             if (typeof removed === 'function') { done = removed; }  // Node-RED < 0.19
             closed = true;
+            if (handoffLease) { handoffLease.release(); handoffLease = null; }
             unregisterOnvifCallbacks(ip, callbacks);
             flushPtzWaiters();
             doStop(false).finally(() => {

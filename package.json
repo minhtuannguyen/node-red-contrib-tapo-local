@@ -2,6 +2,9 @@
     "name": "@minguyen68/node-red-contrib-tapo-local",
     "version": "0.3.1",
     "description": "Node-RED node for local control of Tapo C225 cameras — no cloud, no extra deps",
+    "scripts": {
+        "test": "node --unhandled-rejections=strict test/tapo-client.js"
+    },
     "keywords": [
         "node-red",
         "node-red-contrib",
