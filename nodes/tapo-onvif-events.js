@@ -8,7 +8,7 @@
  *
  *  • Zero HTTP requests sent to the camera while stopped.
  *  • Proper ONVIF Unsubscribe sent on stop (camera frees the pull-point).
- *  • Exponential back-off we control (3 s → 6 s → … → 2 min max).
+ *  • Exponential back-off on every failure path (5 s → 10 s → … → 60 s max).
  *  • Tapo C225 quirk handled: camera sends "Initialized" events batched every
  *    ~14 s while motion is present (not "Changed" events on state change).
  *    Debounce + configurable watchdog emit clean detected:true / detected:false.
@@ -20,11 +20,11 @@
  *   1. GetCapabilities          → discover event service XAddr
  *   2. CreatePullPointSubscription → subscriptionUrl (valid for ttl seconds)
  *   3. PullMessages loop        → camera holds ≤pullTimeoutSec per call
- *   4. Renew every 50 s         → keep subscription alive (TTL = 60 s)
+ *   4. Renew inline between pulls → keep subscription alive (TTL ≥ 120 s)
  *   5. Unsubscribe on stop      → camera cleans up immediately
  */
 
-const { registerOnvifCallbacks, unregisterOnvifCallbacks, executeOnDevice, releaseSession } = require('../lib/tapo-client');
+const { registerOnvifCallbacks, unregisterOnvifCallbacks, executeOnDevice, releaseSession, noteDeviceReachable, COMMANDS } = require('../lib/tapo-client');
 const { soapEnvelope, soapPost, dropRoute, xmlFindAll, xmlInner, xmlText, xmlAttr } = require('../lib/onvif-soap');
 
 // ── ONVIF operations ──────────────────────────────────────────────────────────
@@ -150,7 +150,7 @@ module.exports = function (RED) {
         // per minute (25 s ≈ 2–3 req/min; 5 s ≈ 12 req/min).  Event delivery
         // latency is unaffected — the camera flushes the response as soon as
         // events arrive, regardless of the timeout ceiling.
-        const pullTimeoutSec  = parseInt(config.pullTimeout,  10) || 25;
+        const pullTimeoutSec  = Math.min(Math.max(parseInt(config.pullTimeout, 10) || 25, 5), 120);
         const motionTimeoutMs = (parseInt(config.motionTimeout, 10) || 30) * 1000;
 
         if (!deviceNode) {
@@ -166,18 +166,24 @@ module.exports = function (RED) {
         const deviceUrl = `http://${ip}:${onvifPort}/onvif/device_service`;
 
         // ── Node state ────────────────────────────────────────────────────────
-        let active          = false;   // true = poll loop should keep running
-        let stopping        = false;   // true while doStop() is in its async cleanup phase
+        // Each running poll loop owns a context object.  doStop() marks it
+        // stopped, so a loop still awaiting a slow request can never resume
+        // after a quick stop→start (which previously left two loops running).
+        //   ctx = { stopped, req, isPull, interrupted, subUrl, wake }
+        let loop            = null;    // context of the current poll loop (null = idle)
+        let stopping        = null;    // Promise while doStop() cleanup runs
+        let intent          = 0;       // bumped on every start/stop request; orders deferred starts
         let closed          = false;   // node has been closed/removed
-        let eventUrl        = null;    // discovered event service XAddr
-        let subscriptionUrl = null;    // active pull-point subscription URL
-        let renewTimer      = null;    // setInterval for subscription renewal
-        let wakeResolve     = null;    // resolves the current sleep() early on stop
-        let currentReq      = null;    // the live http.ClientRequest for any poll-loop op
-                                       // (GetCapabilities, CreateSubscription, or PullMessages)
-                                       // doStop() destroys it to free the camera's connection slot
-        let retryMs         = 5000;    // GetCapabilities back-off: 5→10→20→40→60 s max
+        let eventUrl        = null;    // discovered event service XAddr (stable per camera)
+        let ptzHolds        = 0;       // >0 while a PTZ command needs the connection slot
+        let ptzWaiters      = [];      // loops paused until PTZ releases the slot
 
+        const SUB_TTL_SECS         = Math.max(120, (pullTimeoutSec + 10) * 3);
+        // Renew inline between pulls; leaves room for one full pull + a PTZ pause inside the TTL.
+        const RENEW_EVERY_MS       = Math.max(20, SUB_TTL_SECS - pullTimeoutSec - 45) * 1000;
+        const PULL_MIN_INTERVAL_MS = 1000;   // never spin if the camera answers PullMessages instantly
+        const PTZ_GRACE_MS         = 3000;   // keep the slot free briefly: a Stop usually follows a move
+        const PTZ_HOLD_MAX_MS      = 30000;  // safety: never pause polling forever
 
         // Per-topic motion-detection state (reset on stop)
         let debounceTimers = {};
@@ -193,18 +199,27 @@ module.exports = function (RED) {
             motionActive   = {}; batchHasTrue   = {}; batchActive = {};
         }
 
-        // Interruptible sleep — wakeUp() resolves it immediately.
-        // Nulls wakeResolve on natural completion so the closure (holding the
-        // fired timer + settled resolve) can be GC'd promptly instead of hanging
-        // around until the next sleep() overwrites it.
-        function sleep(ms) {
+        const delay = ms => new Promise(r => setTimeout(r, ms));
+
+        // Interruptible sleep — doStop() calls ctx.wake() to resolve it immediately.
+        function sleep(ctx, ms) {
             return new Promise(resolve => {
-                const t = setTimeout(() => { wakeResolve = null; resolve(); }, ms);
-                wakeResolve = () => { clearTimeout(t); wakeResolve = null; resolve(); };
+                const t = setTimeout(done, ms);
+                function done() { clearTimeout(t); if (ctx.wake === done) ctx.wake = null; resolve(); }
+                ctx.wake = done;
             });
         }
-        function wakeUp() {
-            if (wakeResolve) wakeResolve();  // wakeResolve nulls itself
+        function waitForPtz(ctx) {
+            return new Promise(resolve => {
+                function done() { if (ctx.wake === done) ctx.wake = null; resolve(); }
+                ctx.wake = done;
+                ptzWaiters.push(done);
+            });
+        }
+        function flushPtzWaiters() {
+            const w = ptzWaiters;
+            ptzWaiters = [];
+            w.forEach(f => f());
         }
 
         // Guard against sending after the node is closed.
@@ -278,216 +293,172 @@ module.exports = function (RED) {
         }
 
         // ── Poll loop ─────────────────────────────────────────────────────────
-        // Runs until active === false.
-        // On any ONVIF error: Unsubscribe (best effort), wait 5 s, then re-probe
-        // with GetCapabilities.  Flat 5 s retry — no exponential back-off — so
-        // the node recovers promptly without flooding the C225 with rapid requests.
-        async function pollLoop() {
+        // Runs until ctx.stopped.  Every failure path (GetCapabilities, subscribe,
+        // renew, pull, SOAP fault) shares ONE exponential back-off (5 s → 60 s),
+        // reset only after a successful PullMessages.  Previously a camera that
+        // accepted subscriptions but failed pulls was hit every 5 s with an HTTPS
+        // login + GetCapabilities + a NEW pull-point (old ones never released),
+        // which exhausts the C225's subscription table and crashes it.
+        async function pollLoop(ctx, privacyKnownOff) {
+            const alive = () => !ctx.stopped && !closed;
+            const track = req => { ctx.req = req; };
+            let failures         = 0;
+            let needPrivacyCheck = !privacyKnownOff;
+            let renewAt          = 0;
+
+            async function failAndWait(what, err, lostCamera) {
+                failures++;
+                if (ctx.subUrl) dropRoute(ctx.subUrl);
+                ctx.subUrl = null;
+                if (lostCamera) { eventUrl = null; needPrivacyCheck = true; }
+                const ms    = Math.min(5000 * 2 ** Math.min(failures - 1, 4), 60000);
+                const label = `${ms / 1000}s`;
+                node.warn(`${what} failed — retry in ${label}: ${err.message}`);
+                node.status({ fill: 'yellow', shape: 'ring', text: `offline — retry in ${label}` });
+                await sleep(ctx, ms);
+            }
+
             node.status({ fill: 'blue', shape: 'dot', text: 'connecting…' });
 
-            // Tracks whether we have already done the privacy-guard check for the
-            // current reconnect cycle.  Reset to false after a successful
-            // GetCapabilities so we re-check on the next disconnect/reconnect.
-            // Kept true during exponential back-off retries (camera still offline)
-            // to avoid adding a full 12 s REQUEST_TIMEOUT_MS per retry attempt.
-            let privacyGuardDone = false;
-
-            while (active) {
+            while (alive()) {
+                // A PTZ command owns the connection slot — wait until it is done.
+                if (ptzHolds > 0) { await waitForPtz(ctx); continue; }
 
                 // Step 1: GetCapabilities — cached across reconnects; also acts as
-                // a liveness probe after any error (reset to null on error below).
+                // a liveness probe after a connection loss (reset to null there).
                 if (!eventUrl) {
-
-                    // ── Privacy guard before each ONVIF reconnect ────────────────
-                    // Before opening an ONVIF subscription, verify the camera is not
-                    // in privacy mode.  Running a PullMessages long-poll against a
-                    // C225 in privacy mode causes gradual firmware resource exhaustion
-                    // and an eventual crash — observed reproducibly after hours of
-                    // sustained ONVIF subscriptions with no motion events.
-                    //
-                    // This catches two scenarios the startup check cannot cover:
-                    //   A. Camera reboots slowly (>12 s to start HTTPS service) →
-                    //      startup check times out → doStart() fires → camera comes
-                    //      up in privacy mode → ONVIF loop reconnects → crash.
-                    //   B. Camera loses power while ONVIF is running → comes back in
-                    //      privacy mode → backoff loop reconnects without a privacy
-                    //      check → ONVIF subscription created → crash.
-                    //
-                    // Runs only ONCE per reconnect cycle (not on every retry while
-                    // the camera is still offline) to avoid a 12 s overhead per retry.
-                    if (!privacyGuardDone) {
-                        privacyGuardDone = true;
-                        let privacyOn = false;
-                        try {
-                            const lm = await executeOnDevice(ip, user, getPass(),
-                                { method: 'getLensMaskConfig' });
-                            privacyOn = lm?.lens_mask?.lens_mask_info?.enabled === 'on';
-                        } catch (_) {
-                            // Camera unreachable — privacy state unknown.  Proceed to
-                            // GetCapabilities which handles offline retry with
-                            // exponential back-off.
-                        } finally {
-                            // Always release the HTTPS session so the camera's single
-                            // TCP slot is free for the upcoming ONVIF SOAP calls.
-                            // The Tapo HTTPS agent holds an idle keep-alive socket
-                            // that would otherwise block the ONVIF connection attempt.
-                            releaseSession(ip, user);
-                        }
-                        if (!active) break;
-
-                        if (privacyOn) {
-                            // Camera is in privacy mode — stay idle.
-                            // The tapo-local privacy-off command will call doStart()
-                            // via the registry when privacy is disabled.
-                            node.status({ fill: 'grey', shape: 'ring', text: 'privacy — idle' });
-                            active = false;
-                            break;
-                        }
-
-                        // Brief pause for the camera's TCP stack to fully release
-                        // the HTTPS slot after agent.destroy() (the RST may leave
-                        // the slot in a transient FIN_WAIT state for a short time).
-                        await new Promise(r => setTimeout(r, 300));
-                        if (!active) break;
-                    }
-
                     try {
-                        eventUrl = await opGetCapabilities(
-                            deviceUrl, user, getPass(),
-                            (req) => { currentReq = req; },
-                        );
-                        currentReq = null;
-                        retryMs    = 5000;   // camera is reachable — reset back-off
-                        privacyGuardDone = false;  // reconnected — re-arm guard for next disconnect
+                        eventUrl = await opGetCapabilities(deviceUrl, user, getPass(), track);
                     } catch (err) {
-                        currentReq = null;
-                        if (!active) break;
-                        const label = `${retryMs / 1000}s`;
-                        node.warn(`GetCapabilities failed — retry in ${label}: ${err.message}`);
-                        node.status({ fill: 'yellow', shape: 'ring', text: `offline — retry in ${label}` });
-                        await sleep(retryMs);
-                        retryMs = Math.min(retryMs * 2, 60000);  // cap at 60 s
+                        ctx.req = null;
+                        if (!alive()) break;
+                        await failAndWait('GetCapabilities', err, true);
                         continue;
                     }
+                    ctx.req = null;
+                    if (!alive()) break;
+                    noteDeviceReachable(ip);
                 }
 
-                // Step 2: create pull-point subscription.
-                if (!subscriptionUrl) {
+                // Step 2: privacy guard — once per (re)connect, only after the camera
+                // has proven reachable (so the check isn't wasted on an offline camera
+                // and a camera that comes back in privacy mode is always caught).
+                // A PullMessages long-poll against a C225 in privacy mode causes
+                // gradual firmware resource exhaustion and an eventual crash.
+                if (needPrivacyCheck) {
+                    needPrivacyCheck = false;
+                    let privacyOn = false;
                     try {
-                        subscriptionUrl = await opCreateSubscription(
-                            eventUrl, user, getPass(), 120,
-                            (req) => { currentReq = req; },
-                        );
-                        currentReq = null;
-                        // Renew subscription every 90 s (TTL = 120 s).
-                        clearInterval(renewTimer);
-                        renewTimer = setInterval(async () => {
-                            if (!active || !subscriptionUrl) return;
-                            try {
-                                // Store the renewal request in currentReq so doStop() can
-                                // abort it immediately via TCP RST.  Without this, doStop()
-                                // would declare "slot free" after only 600 ms while an
-                                // opRenew() with a 10 s timeout is still in flight — causing
-                                // the subsequent privacy-on HTTPS command to collide on the
-                                // camera's single TCP connection slot.
-                                await opRenew(subscriptionUrl, user, getPass(), 120,
-                                    req => { currentReq = req; });
-                                currentReq = null;
-                            } catch (e) {
-                                currentReq = null;
-                                if (!active) return;  // doStop() aborted the request — expected
-                                node.warn('Subscription renew failed — will re-subscribe: ' + e.message);
-                                if (subscriptionUrl) dropRoute(subscriptionUrl);  // release cached route
-                                subscriptionUrl = null;
-                                // Stop the interval NOW — otherwise it keeps firing every 90 s
-                                // as no-ops until the concurrent PullMessages finally errors out
-                                // and clears it.  On a broken camera those idle wake-ups pile up.
-                                clearInterval(renewTimer);
-                                renewTimer = null;
-                            }
-                        }, 90000);
-                        node.status({ fill: 'green', shape: 'dot', text: 'listening' });
+                        const lm  = await executeOnDevice(ip, user, getPass(), COMMANDS['get-lens-mask']);
+                        privacyOn = lm?.lens_mask?.lens_mask_info?.enabled === 'on';
+                    } catch (_) {
+                        // HTTPS API unavailable — privacy state unknown, proceed.
+                    } finally {
+                        // Free the HTTPS keep-alive socket before the ONVIF calls.
+                        releaseSession(ip, user);
+                    }
+                    if (!alive()) break;
+                    if (privacyOn) {
+                        // Stay idle; privacy-off via tapo-local restarts us through the registry.
+                        node.status({ fill: 'grey', shape: 'ring', text: 'privacy — idle' });
+                        ctx.stopped = true;
+                        if (loop === ctx) loop = null;
+                        break;
+                    }
+                    await sleep(ctx, 300);  // let the camera release the HTTPS slot
+                    continue;
+                }
+
+                // Step 3: create the pull-point subscription, or renew it inline.
+                // Renewing between pulls (not from a timer) guarantees we never hold
+                // two connections to the camera at once.
+                if (!ctx.subUrl) {
+                    try {
+                        ctx.subUrl = await opCreateSubscription(eventUrl, user, getPass(), SUB_TTL_SECS, track);
                     } catch (err) {
-                        if (!active) break;
-                        eventUrl = null;  // force re-probe on next iteration
-                        node.warn(`CreateSubscription failed — retry in 5s: ${err.message}`);
-                        node.status({ fill: 'yellow', shape: 'ring', text: 'offline — retry in 5s' });
-                        await sleep(5000);
+                        ctx.req = null;
+                        if (!alive()) break;
+                        await failAndWait('CreateSubscription', err, !/fault/i.test(err.message));
                         continue;
                     }
+                    ctx.req = null;
+                    renewAt = Date.now() + RENEW_EVERY_MS;
+                    if (!alive()) break;
+                    node.status({ fill: 'green', shape: 'dot', text: 'listening' });
+                } else if (Date.now() >= renewAt) {
+                    try {
+                        const xml = await opRenew(ctx.subUrl, user, getPass(), SUB_TTL_SECS, track);
+                        if (/[Ff]ault/.test(xml)) throw new Error('Renew SOAP fault: ' + xml.slice(0, 300));
+                    } catch (err) {
+                        ctx.req = null;
+                        if (!alive()) break;
+                        await failAndWait('Renew', err, !/fault/i.test(err.message));
+                        continue;
+                    }
+                    ctx.req = null;
+                    renewAt = Date.now() + RENEW_EVERY_MS;
+                    if (!alive()) break;
                 }
 
-                // Step 3: pull messages (camera holds the connection ≤ pullTimeoutSec).
-                // currentReq is tracked so doStop() can TCP-RST it immediately
-                // before opening the Unsubscribe connection.
+                // Step 4: pull messages (camera holds the connection ≤ pullTimeoutSec).
+                // ctx.req is tracked so doStop()/PTZ can TCP-RST it immediately.
+                if (ptzHolds > 0) continue;  // PTZ arrived during subscribe/renew — yield first
+                const pullStart = Date.now();
                 let xml;
+                ctx.isPull      = true;
+                ctx.interrupted = false;
                 try {
-                    xml = await opPullMessages(
-                        subscriptionUrl, user, getPass(), pullTimeoutSec, 100,
-                        (req) => { currentReq = req; },
-                    );
+                    xml = await opPullMessages(ctx.subUrl, user, getPass(), pullTimeoutSec, 100, track);
                 } catch (err) {
-                    currentReq = null;
-                    if (!active) break;   // destroyed by doStop() — exit cleanly
-
-                    // PTZ interrupt — slot freed for PTZ command; resume immediately.
-                    if (err.message === 'ptz-interrupt') continue;
-
-                    // Camera unresponsive or subscription lost.
-                    // Skip Unsubscribe here on purpose:
-                    //   • If the camera is offline, opUnsubscribe would just burn
-                    //     its own 5 s timeout and add another wasted request to
-                    //     an already-struggling device.
-                    //   • If only the subscription died, the pull-point still
-                    //     expires naturally via its 120 s TTL — no cleanup needed.
-                    // doStop() (intentional shutdown) still sends Unsubscribe.
-                    clearInterval(renewTimer);
-                    renewTimer      = null;
-                    const subUrl    = subscriptionUrl;
-                    subscriptionUrl = null;
-                    eventUrl        = null;  // re-probe on next iteration
-                    node.warn(`ONVIF error — retry in 5s: ${err.message}`);
-                    node.status({ fill: 'yellow', shape: 'ring', text: 'offline — retry in 5s' });
-                    if (subUrl) dropRoute(subUrl);  // release cached route — URL is unique per subscription
-                    await sleep(5000);
+                    if (!alive()) break;
+                    // PTZ interrupt — slot handed to PTZ; the loop pauses at the top.
+                    if (ctx.interrupted) continue;
+                    // Skip Unsubscribe: the camera is likely unreachable, and the
+                    // pull-point expires via its TTL anyway.
+                    await failAndWait('PullMessages', err, true);
                     continue;
+                } finally {
+                    ctx.isPull = false;
+                    ctx.req    = null;
                 }
-                currentReq = null;
-                if (!active) break;
+                if (!alive()) break;
 
-                // SOAP fault → subscription expired or invalid → re-subscribe.
+                // SOAP fault → subscription expired or invalid → re-subscribe (with back-off).
                 if (/[Ff]ault/.test(xml)) {
-                    node.warn('PullMessages SOAP fault — re-subscribing in 5s');
-                    clearInterval(renewTimer);
-                    renewTimer      = null;
-                    if (subscriptionUrl) dropRoute(subscriptionUrl);  // release cached route
-                    subscriptionUrl = null;
-                    node.status({ fill: 'yellow', shape: 'ring', text: 'offline — retry in 5s' });
-                    await sleep(5000);
+                    await failAndWait('PullMessages', new Error('SOAP fault: ' + xml.slice(0, 200)), false);
                     continue;
                 }
+                if (failures > 0) node.status({ fill: 'green', shape: 'dot', text: 'listening' });
+                failures = 0;
 
                 const events = parseEvents(xml);
                 for (const ev of events) {
-                    if (!active) break;
+                    if (!alive()) break;
                     processEvent(ev);
                 }
+
+                const elapsed = Date.now() - pullStart;
+                if (elapsed < PULL_MIN_INTERVAL_MS && alive()) await sleep(ctx, PULL_MIN_INTERVAL_MS - elapsed);
             }
 
             // Loop exited — nothing running, nothing consuming camera resources.
         }
 
         // ── Public: start ─────────────────────────────────────────────────────
-        function doStart() {
-            // `stopping`: doStop() is in its async cleanup phase — a new loop
-            // must not start until cleanup finishes, otherwise two loops could run
-            // concurrently and the old loop sees active=true and never exits.
-            if (active || stopping || closed) return;
-            active  = true;
-            retryMs = 5000;   // always start fresh with minimum back-off
-            pollLoop().catch(err => {
-                node.error('Poll loop crashed unexpectedly: ' + err.message);
-            });
+        // privacyKnownOff=true skips the privacy guard (caller just confirmed it).
+        function doStart(privacyKnownOff = false) {
+            const myIntent = ++intent;
+            if (closed || loop) return;
+            // Cleanup still running — start afterwards unless a newer stop/start superseded us.
+            if (stopping) {
+                stopping.then(() => { if (intent === myIntent) doStart(privacyKnownOff); });
+                return;
+            }
+            const ctx = { stopped: false, req: null, isPull: false, interrupted: false, subUrl: null, wake: null };
+            loop = ctx;
+            pollLoop(ctx, privacyKnownOff)
+                .catch(err => node.error('Poll loop crashed unexpectedly: ' + err.message))
+                .finally(() => { if (loop === ctx) loop = null; });
         }
 
         // ── Public: stop ──────────────────────────────────────────────────────
@@ -496,13 +467,20 @@ module.exports = function (RED) {
         // Unsubscribe would open a new connection immediately after the RST and
         // occupy the C225's single connection slot, causing the subsequent Tapo
         // HTTPS command to time out.
+        // Resolves true if a running loop was stopped.
         async function doStop(skipUnsubscribe = false) {
-            if (!active && !subscriptionUrl) return;
-            active   = false;
-            stopping = true;   // block doStart() until cleanup is complete
-            wakeUp();          // abort any in-progress back-off sleep
-            clearInterval(renewTimer);
-            renewTimer = null;
+            intent++;
+            const ctx = loop;
+            if (!ctx) { if (stopping) await stopping; return false; }
+            ctx.stopped = true;
+            loop        = null;
+            stopping    = stopCleanup(ctx, skipUnsubscribe);
+            try { await stopping; } finally { stopping = null; }
+            return true;
+        }
+
+        async function stopCleanup(ctx, skipUnsubscribe) {
+            if (ctx.wake) ctx.wake();  // abort any back-off sleep / PTZ wait
 
             // When stopping due to privacy-on the camera's motion sensor is
             // disabled, so emit detected:false for any topic that was active.
@@ -522,17 +500,17 @@ module.exports = function (RED) {
             clearMotionState();
 
             // ── Abort any in-flight poll-loop request NOW (TCP RST). ─────────
-            // This covers GetCapabilities, CreateSubscription, and PullMessages.
-            if (currentReq) {
-                currentReq.destroy(new Error('stopped'));
-                currentReq = null;
+            // This covers GetCapabilities, CreateSubscription, Renew and PullMessages.
+            if (ctx.req) {
+                ctx.req.destroy(new Error('stopped'));
+                ctx.req = null;
             }
             // Give the camera's firmware time to fully release the TCP slot
             // before the next connection (Unsubscribe or Tapo HTTPS).
-            await new Promise(r => setTimeout(r, 600));
+            await delay(600);
 
-            const subUrl    = subscriptionUrl;
-            subscriptionUrl = null;
+            const subUrl = ctx.subUrl;
+            ctx.subUrl   = null;
 
             if (!skipUnsubscribe && subUrl) {
                 try {
@@ -546,35 +524,48 @@ module.exports = function (RED) {
             // route cache would grow by one entry every stop/start (privacy
             // toggle, camera reboot, PullMessages error, node-red restart …).
             if (subUrl) dropRoute(subUrl);
-            node.status({ fill: 'grey', shape: 'ring', text: 'stopped' });
-            stopping = false;  // cleanup done — doStart() may proceed
+            if (!closed) node.status({ fill: 'grey', shape: 'ring', text: 'stopped' });
         }
 
-        // ── Auto-coordination with tapo-local ─────────────────────────────────
+        // ── Auto-coordination with tapo-local / tapo-ptz ────────────────────────
         // tapo-client awaits stop() before privacy-on (so the camera has one free
-        // connection slot) and calls start() after privacy-off succeeds.
-        registerOnvifCallbacks(ip, {
+        // connection slot) and calls start(true) after privacy-off succeeds.
+        const callbacks = {
             // skip Unsubscribe — sending it would open a connection right before
             // the Tapo HTTPS command and freeze the C225 (one-connection limit).
             stop:  () => doStop(true),
-            start: () => doStart(),  // non-blocking — kicks off the poll loop
-            // PTZ coordination: abort the in-flight PullMessages so the camera's
-            // connection slot is free immediately for the PTZ SOAP command.
-            // The poll loop detects the 'ptz-interrupt' error and restarts cleanly.
+            start: (privacyKnownOff) => doStart(!!privacyKnownOff),
+            // PTZ coordination: pause the poll loop and abort an in-flight
+            // PullMessages so the connection slot is free for the PTZ command.
+            // Returns release(); polling resumes PTZ_GRACE_MS after the last release.
             interrupt: async () => {
-                if (!active || !currentReq) return;
-                currentReq.destroy(new Error('ptz-interrupt'));
-                currentReq = null;
-                // Brief pause — let the camera process the TCP RST before PTZ connects.
-                await new Promise(r => setTimeout(r, 200));
+                ptzHolds++;
+                let released = false;
+                const safety = setTimeout(() => release(), PTZ_HOLD_MAX_MS);
+                function release() {
+                    if (released) return;
+                    released = true;
+                    clearTimeout(safety);
+                    setTimeout(() => { if (--ptzHolds === 0) flushPtzWaiters(); }, PTZ_GRACE_MS);
+                }
+                const ctx = loop;
+                if (ctx && ctx.isPull && ctx.req) {
+                    ctx.interrupted = true;
+                    ctx.req.destroy(new Error('ptz-interrupt'));
+                    ctx.req = null;
+                    // Brief pause — let the camera process the TCP RST before PTZ connects.
+                    await delay(200);
+                }
+                return release;
             },
-        });
+        };
+        registerOnvifCallbacks(ip, callbacks);
 
         // ── Input handler ─────────────────────────────────────────────────────
         node.on('input', async (msg, send, done) => {
             const action = msg.action;
             if (action === 'start') {
-                doStart();
+                doStart(false);
                 done();
             } else if (action === 'stop') {
                 await doStop();
@@ -588,7 +579,8 @@ module.exports = function (RED) {
         node.on('close', (removed, done) => {
             if (typeof removed === 'function') { done = removed; }  // Node-RED < 0.19
             closed = true;
-            unregisterOnvifCallbacks(ip);
+            unregisterOnvifCallbacks(ip, callbacks);
+            flushPtzWaiters();
             doStop(false).finally(() => {
                 // Drop the stable per-camera routes from the shared route cache.
                 // ROUTE_CACHE_MAX already caps growth defensively, but on a redeploy
@@ -607,6 +599,7 @@ module.exports = function (RED) {
         // If the query fails for any reason (wrong creds, camera offline), start
         // the poll loop anyway so the node self-heals once the camera is reachable.
         if (config.autoStart !== false) {
+            const startupIntent = intent;
             node.status({ fill: 'blue', shape: 'ring', text: 'checking privacy…' });
             // Race the Tapo query against a 15 s deadline.  15 s > REQUEST_TIMEOUT_MS
             // (12 s) so the executeOnDevice timeout always fires first on an offline
@@ -615,24 +608,29 @@ module.exports = function (RED) {
             // respond (e.g. still booting after a power-cycle while in privacy mode),
             // which would cause doStart() to launch the ONVIF poll loop incorrectly and
             // hammer the camera before it has fully initialised.
-            const checkDone    = executeOnDevice(ip, user, getPass(), { method: 'getLensMaskConfig' });
+            const checkDone    = executeOnDevice(ip, user, getPass(), COMMANDS['get-lens-mask']);
             let startupTimer   = null;
             const checkTimeout = new Promise((_, rej) => {
                 startupTimer = setTimeout(() => rej(new Error('startup check timeout')), 15000);
             });
             Promise.race([checkDone, checkTimeout])
                 .then(r => {
+                    // Free the HTTPS keep-alive socket before ONVIF opens its connection.
+                    releaseSession(ip, user);
+                    if (closed || intent !== startupIntent) return;  // user/registry already decided
                     const privacyOn = r?.lens_mask?.lens_mask_info?.enabled === 'on';
                     if (privacyOn) {
                         node.status({ fill: 'grey', shape: 'ring', text: 'privacy — idle' });
                     } else {
-                        doStart();
+                        doStart(true);
                     }
                 })
                 .catch(() => {
-                    // Camera offline (12 s REQUEST_TIMEOUT_MS elapsed) — start the poll
-                    // loop and let exponential back-off handle recovery (5 → 60 s cap).
-                    doStart();
+                    releaseSession(ip, user);
+                    if (closed || intent !== startupIntent) return;
+                    // Privacy state unknown — the poll loop re-checks it once the
+                    // camera answers ONVIF, with exponential back-off (5 → 60 s cap).
+                    doStart(false);
                 })
                 .finally(() => {
                     // Clear the losing arm of the race so its setTimeout does not stay

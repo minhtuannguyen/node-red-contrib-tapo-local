@@ -25,6 +25,65 @@
 const { soapPost, soapEnvelope, xmlText, xmlFindAll, xmlAttr, xmlInner, escXml } = require('../lib/onvif-soap');
 const { interruptOnvifForPtz } = require('../lib/tapo-client');
 
+// ── Per-camera PTZ coordination (shared by all tapo-ptz nodes) ───────────────
+// One HomeKit button = one tapo-ptz node, so serialization must be per IP,
+// not per node.  Commands run one at a time; a waiting move/stop is dropped
+// when a newer move/stop arrives (only the latest direction matters), and
+// after a network failure commands fail fast until the back-off expires.
+const PTZ_QUEUE_MAX   = 4;
+const PTZ_ACTIONS     = new Set(['continuousMove', 'stop', 'gotoPreset', 'getPresets']);
+const PTZ_BACKOFF_MIN = 3000;
+const PTZ_BACKOFF_MAX = 30000;
+const NET_ERR_RE      = /timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|EHOSTDOWN|ENETUNREACH|ENOTFOUND|EAI_AGAIN|socket hang up|closed before response|ONVIF HTTP/;
+const _ptzDevices     = new Map(); // ip → { tail, waiting: [], failures, blockedUntil }
+
+function ptzDevice(ip) {
+    let d = _ptzDevices.get(ip);
+    if (!d) { d = { tail: Promise.resolve(), waiting: [], failures: 0, blockedUntil: 0 }; _ptzDevices.set(ip, d); }
+    return d;
+}
+
+function assertPtzAvailable(ip, d) {
+    if (Date.now() < d.blockedUntil) {
+        const secs = Math.ceil((d.blockedUntil - Date.now()) / 1000);
+        throw new Error(`Camera ${ip} unreachable — PTZ not sent, retry in ${secs}s`);
+    }
+}
+
+// Resolves with the result, or with { superseded: true } if a newer move/stop replaced it.
+function enqueuePtz(ip, action, run) {
+    const d = ptzDevice(ip);
+    assertPtzAvailable(ip, d);
+    const movement = action === 'continuousMove' || action === 'stop';
+    if (movement) {
+        for (const w of d.waiting) if (w.movement && !w.cancelled) w.cancelled = true;
+    }
+    if (d.waiting.filter(w => !w.cancelled).length >= PTZ_QUEUE_MAX) {
+        throw new Error(`PTZ queue for ${ip} is full — command dropped`);
+    }
+    const entry = { movement, cancelled: false };
+    d.waiting.push(entry);
+    const op = d.tail.then(async () => {
+        d.waiting.splice(d.waiting.indexOf(entry), 1);
+        if (entry.cancelled) return { superseded: true };
+        assertPtzAvailable(ip, d);
+        try {
+            const result = await run();
+            d.failures = 0;
+            d.blockedUntil = 0;
+            return result;
+        } catch (err) {
+            if (NET_ERR_RE.test(err.message)) {
+                d.failures++;
+                d.blockedUntil = Date.now() + Math.min(PTZ_BACKOFF_MIN * 2 ** Math.min(d.failures - 1, 10), PTZ_BACKOFF_MAX);
+            }
+            throw err;
+        }
+    });
+    d.tail = op.catch(() => {});
+    return op;
+}
+
 module.exports = function (RED) {
 
     function TapoPtzNode(config) {
@@ -48,7 +107,7 @@ module.exports = function (RED) {
 
         // Profile token is configured directly (default: MediaProfile000 for C225).
         // PTZ service URL is discovered once from GetCapabilities then cached.
-        const profileToken = config.profileToken || 'MediaProfile000';
+        const profileToken = escXml(config.profileToken || 'MediaProfile000');
         let ptzUrl         = null;   // PTZ service XAddr from GetCapabilities
 
         // ── Service discovery ─────────────────────────────────────────────────
@@ -71,10 +130,17 @@ module.exports = function (RED) {
 
         // ── PTZ command execution ─────────────────────────────────────────────
         async function execPtz(action, pan, tilt, preset) {
-            // Abort any in-flight PullMessages in tapo-onvif-events so the camera's
-            // single connection slot is immediately available for PTZ.
-            await interruptOnvifForPtz(ip);
+            // Pause tapo-onvif-events (aborting its in-flight PullMessages) so the
+            // camera's connection slot is free for PTZ; resume when done.
+            const release = await interruptOnvifForPtz(ip);
+            try {
+                return await execPtzCommand(action, pan, tilt, preset);
+            } finally {
+                release();
+            }
+        }
 
+        async function execPtzCommand(action, pan, tilt, preset) {
             await ensureDiscovered();
 
             let xml;
@@ -141,33 +207,47 @@ module.exports = function (RED) {
                 throw new Error(`Unknown PTZ action: "${action}". Use continuousMove, stop, gotoPreset, or getPresets.`);
             }
 
-                if (/[Ff]ault/.test(xml)) {
-                // SOAP fault — clear cached PTZ URL so next call re-discovers.
-                ptzUrl = null;
+            if (/[Ff]ault/.test(xml)) {
                 throw new Error(`${action} SOAP fault: ` + xml.slice(0, 300));
             }
             return {};
         }
 
+        // Speeds outside [-1, 1] or NaN produce SOAP faults on every press.
+        const speed = v => { const n = Number(v); return Number.isFinite(n) ? Math.max(-1, Math.min(1, n)) : 0; };
+
         // ── Input handler ─────────────────────────────────────────────────────
         node.on('input', async (msg, send, done) => {
             const action = msg.action  !== undefined ? msg.action  : (config.action || 'continuousMove');
-            const pan    = msg.pan     !== undefined ? Number(msg.pan)    : Number(config.pan    || 0);
-            const tilt   = msg.tilt    !== undefined ? Number(msg.tilt)   : Number(config.tilt   || 0);
+            const pan    = speed(msg.pan  !== undefined ? msg.pan  : (config.pan  || 0));
+            const tilt   = speed(msg.tilt !== undefined ? msg.tilt : (config.tilt || 0));
             const preset = msg.preset  !== undefined ? msg.preset  : (config.preset  || '');
+
+            // Reject bad input before pausing ONVIF or contacting the camera.
+            if (!PTZ_ACTIONS.has(action)) {
+                done(new Error(`Unknown PTZ action: "${action}". Use continuousMove, stop, gotoPreset, or getPresets.`));
+                return;
+            }
+            if (action === 'gotoPreset' && !preset) {
+                done(new Error('msg.preset or node preset token is required for gotoPreset'));
+                return;
+            }
 
             node.status({ fill: 'blue', shape: 'dot', text: action });
             try {
-                const result = await execPtz(action, pan, tilt, preset);
+                const result = await enqueuePtz(ip, action, () => execPtz(action, pan, tilt, preset));
+                if (result && result.superseded) {
+                    node.status({ fill: 'grey', shape: 'dot', text: `${action} (superseded)` });
+                    done();
+                    return;
+                }
                 node.status({ fill: 'green', shape: 'dot', text: action });
                 msg.payload = { action, result };
                 send(msg);
                 done();
             } catch (err) {
-                // On any connection failure clear cached URLs so next attempt re-discovers.
-                if (/timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND/.test(err.message)) {
-                    ptzUrl = null;
-                }
+                // Wrong endpoint (e.g. 404) — rediscover on the next command.
+                if (/ONVIF HTTP/.test(err.message)) ptzUrl = null;
                 node.status({ fill: 'red', shape: 'ring', text: err.message.slice(0, 50) });
                 done(err);
             }
