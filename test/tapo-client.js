@@ -31,9 +31,22 @@ async function withWallClock(test) {
     }
 }
 
+async function withMonotonicClock(test) {
+    const descriptor = Object.getOwnPropertyDescriptor(performance, 'now');
+    const originalNow = performance.now.bind(performance);
+    let offset = 0;
+    Object.defineProperty(performance, 'now', { configurable: true, value: () => originalNow() + offset });
+    try {
+        await test(value => { offset = value; });
+    } finally {
+        if (descriptor) Object.defineProperty(performance, 'now', descriptor);
+        else delete performance.now;
+    }
+}
+
 function fixture() {
     const camera = {
-        requests: [], commands: [], sessions: new Map(), setting: 'off',
+        requests: [], commands: [], sessions: new Map(), setting: 'off', privacy: 'off',
         onCommand: async () => ({}), onLogin: async () => {},
     };
     let pending;
@@ -72,7 +85,9 @@ function fixture() {
         if (reply.raw) return { body: reply.raw, status: reply.status, headers: reply.headers };
         if (command.method === 'setLedStatus') camera.setting = command.params.led.config.enabled;
         if (command.method === 'changeState') camera.setting = 'off';
-        const result = { enabled: camera.setting };
+        if (command.method === 'setLensMaskConfig') camera.privacy = command.params.lens_mask.lens_mask_info.enabled;
+        const result = command.method === 'getLensMaskConfig'
+            ? { lens_mask: { lens_mask_info: { enabled: camera.privacy } } } : { enabled: camera.setting };
         const inner = direct ? { error_code: 0, result }
             : { error_code: 0, result: { responses: [{ error_code: 0, result }] } };
         const cipher = crypto.createCipheriv('aes-128-cbc', session.key, session.iv);
@@ -115,24 +130,52 @@ function fixture() {
     return { client, camera, ip, send };
 }
 
-async function eventFixture({ tls = false, expired = false } = {}) {
+const HOLD = Symbol('connected, no reply yet');
+const ONVIF_DEFAULTS = {
+    GetCapabilities: '<Capabilities><Events><XAddr>http://mock-camera:2020/events</XAddr></Events></Capabilities>',
+    CreatePullPointSubscription: '<SubscriptionReference><Address>http://mock-camera:2020/sub/1</Address></SubscriptionReference>',
+    PullMessages: HOLD,
+    Renew: '<RenewResponse/>',
+    Unsubscribe: '<UnsubscribeResponse/>',
+    ContinuousMove: '<ContinuousMoveResponse/>',
+    Stop: '<StopResponse/>',
+};
+
+async function waitFor(predicate, ms = 3000) {
+    const end = performance.now() + ms;
+    while (!predicate()) {
+        if (performance.now() > end) throw new Error('Timed out waiting for condition');
+        await delay(10);
+    }
+}
+
+// Real event node against scripted ONVIF requests.  `script[op](request)` returns XML, { status, body },
+// HOLD (connected, no reply) or undefined (still connecting); unlisted operations use ONVIF_DEFAULTS.
+async function eventFixture({ script = {}, leases = 'real', leaseHoldMs, autoStart = false, privacy = 'off' } = {}) {
     const base = fixture();
+    base.camera.privacy = privacy;
     const originalHttpRequest = http.request;
     const cameraRequest = https.request;
-    const ready = deferred();
-    const leaseReady = deferred();
-    const acquire = base.client.acquireLease;
+    const created = [];
+    const seen = [];
+    const leaseLog = [];
+    const statuses = [];
+    const warns = [];
+    const realAcquire = base.client.acquireLease;
+    let acquireCalls = 0;
     let expiredLease = null;
-    if (expired) {
-        expiredLease = await acquire(base.ip, { holdMs: 20 });
+    if (leases === 'expired') {
+        expiredLease = await realAcquire(base.ip, { holdMs: 20 });
         const expiredSignal = deferred();
         const off = expiredLease.signal.on(expiredSignal.resolve);
         await expiredSignal.promise;
         off();
     }
     base.client.acquireLease = async (ip, options) => {
-        const lease = expiredLease || await acquire(ip, { ...options, holdMs: tls ? 450 : 50 });
-        leaseReady.resolve(lease);
+        acquireCalls++;
+        if (leases === 'null') return null;
+        const lease = expiredLease || await realAcquire(ip, leaseHoldMs ? { ...options, holdMs: leaseHoldMs } : options);
+        if (lease) leaseLog.push(lease);
         return lease;
     };
 
@@ -141,10 +184,8 @@ async function eventFixture({ tls = false, expired = false } = {}) {
         const socket = new EventEmitter();
         socket.connecting = true;
         socket.encrypted = options.port === 443;
-        request.socket = socket;
-        request.destroyed = false;
-        request.writes = 0;
-        request.write = () => { request.writes++; };
+        Object.assign(request, { socket, destroyed: false, writes: 0, body: '', op: null });
+        request.write = chunk => { request.writes++; request.body += chunk; };
         request.destroy = error => {
             if (request.destroyed) return;
             request.destroyed = true;
@@ -156,19 +197,26 @@ async function eventFixture({ tls = false, expired = false } = {}) {
         };
         request.end = () => {
             request.emit('socket', socket);
-            if (tls && !socket.encrypted) {
-                socket.connecting = false;
-                socket.emit('connect');
+            request.op = (/<(?:\w+:)?(GetCapabilities|CreatePullPointSubscription|PullMessages|Renew|Unsubscribe|ContinuousMove|Stop)\b/.exec(request.body) || [])[1];
+            seen.push(request);
+            const reply = request.op in script ? script[request.op](request) : ONVIF_DEFAULTS[request.op];
+            if (reply === undefined) return;
+            socket.connecting = false;
+            socket.emit(socket.encrypted ? 'secureConnect' : 'connect');
+            if (reply === HOLD) return;
+            setImmediate(() => {
+                if (request.destroyed) return;
                 const response = new EventEmitter();
-                response.statusCode = 200;
+                response.statusCode = reply.status || 200;
+                response.headers = {};
                 response.complete = true;
                 callback(response);
-                response.emit('data', Buffer.from('<Events><XAddr>https://mock-camera/events</XAddr></Events>'));
+                response.emit('data', Buffer.from(typeof reply === 'string' ? reply : reply.body || ''));
                 response.emit('end');
                 request.emit('close');
-            }
+            });
         };
-        if (!tls || socket.encrypted) ready.resolve(request);
+        created.push(request);
         return request;
     }
     http.request = soapRequest;
@@ -181,8 +229,8 @@ async function eventFixture({ tls = false, expired = false } = {}) {
             const emitter = new EventEmitter();
             node.on = emitter.on.bind(emitter);
             node.emit = emitter.emit.bind(emitter);
-            node.status = () => {};
-            node.warn = () => {};
+            node.status = status => statuses.push(status.text);
+            node.warn = message => warns.push(String(message));
             node.error = () => {};
             node.send = () => {};
         },
@@ -192,15 +240,38 @@ async function eventFixture({ tls = false, expired = false } = {}) {
     const eventPath = require.resolve('../nodes/tapo-onvif-events');
     delete require.cache[eventPath];
     require(eventPath)(RED);
-    const node = new types['tapo-onvif-events']({ device: 'test-device', autoStart: !tls });
-    if (tls) node.emit('input', { action: 'start' }, () => {}, () => {});
-    return { ...base, request: ready.promise, lease: leaseReady.promise,
+    const node = new types['tapo-onvif-events']({ device: 'test-device', autoStart });
+    const input = action => node.emit('input', { action }, () => {}, () => {});
+    const ops = () => seen.map(request => request.op);
+    const ptzPath = require.resolve('../nodes/tapo-ptz');
+    const ptzNodes = [];
+    function createPtz() {
+        if (!types['tapo-ptz']) {
+            delete require.cache[ptzPath];
+            require(ptzPath)(RED);
+        }
+        const ptz = new types['tapo-ptz']({ device: 'test-device' });
+        ptzNodes.push(ptz);
+        const messages = [];
+        return {
+            messages,
+            send: action => new Promise(resolve => ptz.emit('input', { action }, message => messages.push(message), resolve)),
+            close: () => ptz.emit('close'),
+        };
+    }
+    return { ...base, node, input, created, seen, ops, leaseLog, statuses, warns, realAcquire,
+        createPtz,
+        acquireCalls: () => acquireCalls,
         async close() {
-            try { await new Promise(resolve => node.emit('close', false, resolve)); }
+            try {
+                for (const ptz of ptzNodes) ptz.emit('close');
+                await new Promise(resolve => node.emit('close', false, resolve));
+            }
             finally {
                 http.request = originalHttpRequest;
                 https.request = cameraRequest;
                 delete require.cache[eventPath];
+                delete require.cache[ptzPath];
             }
         },
     };
@@ -214,10 +285,12 @@ tests.push(['all catalogue setters explicitly declare complete-state coalescing'
 }]);
 
 tests.push(['event handoff expiry destroys pending connection before queued HTTPS proceeds', async () => {
-    const events = await eventFixture();
+    const events = await eventFixture({ script: { GetCapabilities: () => undefined }, leaseHoldMs: 50 });
     try {
-        const request = await events.request;
-        const lease = await events.lease;
+        events.input('start');
+        await waitFor(() => events.created.length === 1);
+        const request = events.created[0];
+        const lease = events.leaseLog[0];
         assert.strictEqual(request.destroyed, false);
         events.camera.onCommand = async () => { assert.strictEqual(request.destroyed, true); return {}; };
         await events.send(events.client.COMMANDS['get-device-info']);
@@ -228,15 +301,23 @@ tests.push(['event handoff expiry destroys pending connection before queued HTTP
 }]);
 
 tests.push(['TLS handoff stays protected after TCP connect until secureConnect', async () => {
-    const events = await eventFixture({ tls: true });
+    const events = await eventFixture({
+        leaseHoldMs: 2000,
+        script: {
+            GetCapabilities: () => '<Capabilities><Events><XAddr>https://mock-camera/events</XAddr></Events></Capabilities>',
+            CreatePullPointSubscription: () => undefined,
+        },
+    });
     try {
-        const request = await events.request;
-        const lease = await events.lease;
+        events.input('start');
+        await waitFor(() => events.ops().includes('CreatePullPointSubscription'));
+        const request = events.seen[events.seen.length - 1];
+        const lease = events.leaseLog[events.leaseLog.length - 1];
         request.socket.connecting = false;
         request.socket.emit('connect');
         let completed = false;
         const queued = events.send(events.client.COMMANDS['get-device-info']).then(() => { completed = true; });
-        await delay(20);
+        await delay(30);
         assert.strictEqual(completed, false);
         request.socket.emit('secureConnect');
         await queued;
@@ -247,17 +328,281 @@ tests.push(['TLS handoff stays protected after TCP connect until secureConnect',
 }]);
 
 tests.push(['already-expired event handoff cancels immediately without SOAP writes', async () => {
-    const events = await eventFixture({ expired: true });
+    const events = await eventFixture({ leases: 'expired' });
     try {
-        const request = await events.request;
-        const lease = await events.lease;
-        await delay(10);
-        assert.strictEqual(request.destroyed, true);
-        assert.strictEqual(request.writes, 0);
-        assert.strictEqual(lease.signal.fns.size, 0);
+        events.input('start');
+        await waitFor(() => events.created.length === 1);
+        await delay(20);
+        assert.strictEqual(events.created[0].destroyed, true);
+        assert.strictEqual(events.created[0].writes, 0);
         await events.send(events.client.COMMANDS['get-device-info']);
     } finally { await events.close(); }
 }]);
+
+tests.push(['failed handoff sends no event traffic and defers the retry', async () => {
+    const events = await eventFixture({ leases: 'null' });
+    try {
+        events.input('start');
+        await waitFor(() => events.acquireCalls() === 1);
+        await delay(300);
+        assert.strictEqual(events.created.length, 0);
+        assert.strictEqual(events.acquireCalls(), 1);
+        assert(events.warns.some(message => /Hand-off failed/.test(message)));
+    } finally { await events.close(); }
+}]);
+
+for (const phase of ['GetCapabilities', 'ContinuousMove']) {
+    tests.push([`closing PTZ during ${phase} cancels the request and queued commands`, async () => {
+        const events = await eventFixture({ script: { [phase]: () => HOLD } });
+        const ptz = events.createPtz();
+        const running = ptz.send('continuousMove');
+        let queued;
+        try {
+            await waitFor(() => events.ops().includes(phase));
+            const request = events.seen[events.seen.length - 1];
+            queued = ptz.send('stop');
+            ptz.close();
+            assert.strictEqual(request.destroyed, true);
+            await Promise.all([running, queued]);
+            assert(!events.ops().includes('Stop'));
+            assert.strictEqual(ptz.messages.length, 0);
+            const lease = await events.realAcquire(events.ip, { waitMs: 200 });
+            assert(lease, 'Closing PTZ must release its control lease');
+            lease.release();
+        } finally {
+            for (const request of events.created) request.destroy(new Error('ECONNRESET'));
+            await Promise.all([running, queued]);
+            await events.close();
+        }
+    }]);
+}
+
+tests.push(['closing PTZ during lease acquisition prevents later SOAP traffic', async () => {
+    const events = await eventFixture();
+    const blocker = await events.realAcquire(events.ip);
+    const ptz = events.createPtz();
+    const running = ptz.send('continuousMove');
+    try {
+        await waitFor(() => events.acquireCalls() === 1);
+        ptz.close();
+        blocker.release();
+        await running;
+        assert.deepStrictEqual(events.ops(), []);
+        assert.strictEqual(ptz.messages.length, 0);
+    } finally {
+        blocker.release();
+        await running;
+        await events.close();
+    }
+}]);
+
+for (const [phase, script] of [
+    ['discovery', { GetCapabilities: () => HOLD }],
+    ['subscription creation', { CreatePullPointSubscription: () => HOLD }],
+]) {
+    tests.push([`PTZ interruption during ${phase} cancels the request and starts nothing new`, async () => {
+        const events = await eventFixture({ script });
+        let release;
+        try {
+            events.input('start');
+            const op = phase === 'discovery' ? 'GetCapabilities' : 'CreatePullPointSubscription';
+            await waitFor(() => events.ops().includes(op));
+            const held = events.seen[events.seen.length - 1];
+            release = await events.client.interruptOnvifForPtz(events.ip);
+            assert.strictEqual(held.destroyed, true);
+            const count = events.created.length;
+            await delay(400);
+            assert.strictEqual(events.created.length, count);
+        } finally { if (release) release(); await events.close(); }
+    }]);
+}
+
+tests.push(['PTZ interruption during renewal of a reused subscription, which also avoids a second Create', async () => {
+    const events = await eventFixture({ script: { Renew: () => HOLD } });
+    let release;
+    try {
+        events.input('start');
+        await waitFor(() => events.ops().includes('PullMessages'));
+        await events.send(events.client.COMMANDS['privacy-on']);
+        await events.send(events.client.COMMANDS['privacy-off']);
+        await waitFor(() => events.ops().includes('Renew'));
+        const held = events.seen[events.seen.length - 1];
+        release = await events.client.interruptOnvifForPtz(events.ip);
+        assert.strictEqual(held.destroyed, true);
+        const count = events.created.length;
+        await delay(400);
+        assert.strictEqual(events.created.length, count);
+        assert.strictEqual(events.ops().filter(op => op === 'CreatePullPointSubscription').length, 1);
+    } finally { if (release) release(); await events.close(); }
+}]);
+
+tests.push(['PTZ interruption during cleanup Unsubscribe cancels it', async () => {
+    const events = await eventFixture({ script: { Unsubscribe: () => HOLD } });
+    let release;
+    try {
+        events.input('start');
+        await waitFor(() => events.ops().includes('PullMessages'));
+        events.input('stop');
+        await waitFor(() => events.ops().includes('Unsubscribe'));
+        const held = events.seen[events.seen.length - 1];
+        release = await events.client.interruptOnvifForPtz(events.ip);
+        assert.strictEqual(held.destroyed, true);
+    } finally { if (release) release(); await events.close(); }
+}]);
+
+tests.push(['PTZ arriving between ONVIF requests prevents the next one from starting', async () => {
+    const events = await eventFixture();
+    let release;
+    try {
+        events.camera.onCommand = async () => { await delay(200); return {}; };
+        events.input('start');
+        await waitFor(() => events.ops().includes('GetCapabilities') && events.camera.commands.length === 1);
+        release = await events.client.interruptOnvifForPtz(events.ip);
+        await delay(600);
+        assert.deepStrictEqual(events.ops(), ['GetCapabilities']);
+    } finally { if (release) release(); await events.close(); }
+}]);
+
+tests.push(['stopping while a handoff is queued leaves no lease holding HTTPS', async () => {
+    const events = await eventFixture();
+    try {
+        const blocker = await events.realAcquire(events.ip);
+        events.input('start');
+        await waitFor(() => events.acquireCalls() === 1);
+        events.input('stop');
+        await delay(50);
+        blocker.release();
+        const started = performance.now();
+        const next = await events.realAcquire(events.ip, { waitMs: 400 });
+        assert(next && performance.now() - started < 300, 'a cancelled handoff must not hold the HTTPS queue');
+        next.release();
+        assert.strictEqual(events.created.length, 0);
+    } finally { await events.close(); }
+}]);
+
+tests.push(['confirmed privacy-on at startup takes no lease and sends no ONVIF traffic', async () => {
+    const events = await eventFixture({ autoStart: true, privacy: 'on' });
+    try {
+        await waitFor(() => events.statuses.includes('privacy — idle'));
+        await delay(100);
+        assert.strictEqual(events.acquireCalls(), 0);
+        assert.strictEqual(events.created.length, 0);
+    } finally { await events.close(); }
+}]);
+
+for (const [name, setup] of [
+    ['missing lens-mask field', camera => { camera.privacy = undefined; }],
+    ['unavailable HTTPS API', camera => { camera.onLogin = async () => { throw Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }); }; }],
+]) {
+    tests.push([`unknown privacy (${name}) is not treated as off`, async () => {
+        const events = await eventFixture();
+        try {
+            setup(events.camera);
+            events.input('start');
+            await waitFor(() => events.warns.some(message => /Privacy check failed/.test(message)));
+            await delay(300);
+            assert.deepStrictEqual(events.ops(), ['GetCapabilities']);
+        } finally { await events.close(); }
+    }]);
+}
+
+tests.push(['unknown periodic privacy recheck withholds pulls until confirmed off again', async () => withMonotonicClock(async shift => {
+    const firstPull = deferred();
+    let pulls = 0;
+    const events = await eventFixture({ script: { PullMessages: () => {
+        pulls++;
+        if (pulls === 1) { firstPull.resolve(); return '<PullMessagesResponse/>'; }
+        return HOLD;
+    } } });
+    try {
+        events.input('start');
+        await firstPull.promise;
+        events.camera.privacy = undefined;
+        shift(301000);
+        await waitFor(() => events.camera.commands.filter(method => method === 'getLensMaskConfig').length >= 2);
+        await delay(400);
+        assert.strictEqual(pulls, 1, 'Unknown privacy must not reuse an old off result');
+        assert(events.warns.some(message => /Privacy check failed/.test(message)));
+        events.camera.privacy = 'off';
+        await waitFor(() => pulls === 2, 8000);
+    } finally { await events.close(); }
+})]);
+
+tests.push(['transient pull failure renews the existing subscription instead of creating another', async () => {
+    let pulls = 0;
+    const events = await eventFixture({ script: { PullMessages: () => (++pulls === 1 ? { status: 500, body: '' } : HOLD) } });
+    try {
+        events.input('start');
+        await waitFor(() => pulls === 2, 12000);
+        const ops = events.ops();
+        assert.strictEqual(ops.filter(op => op === 'CreatePullPointSubscription').length, 1);
+        assert.strictEqual(ops.filter(op => op === 'Renew').length, 1);
+    } finally { await events.close(); }
+}]);
+
+for (const interrupted of [false, true]) {
+    tests.push([`uncertain subscription creation after ${interrupted ? 'PTZ cancellation' : 'transport failure'} is not repeated before expiry`, async () => withMonotonicClock(async shift => {
+        let creates = 0;
+        const events = await eventFixture({ script: { CreatePullPointSubscription: request => {
+            if (++creates > 1) return ONVIF_DEFAULTS.CreatePullPointSubscription;
+            if (!interrupted) request.destroy(new Error('lost subscription response'));
+            return HOLD;
+        } } });
+        let release;
+        try {
+            events.input('start');
+            await waitFor(() => creates === 1);
+            if (interrupted) {
+                release = await events.client.interruptOnvifForPtz(events.ip);
+                release();
+                await delay(3300);
+            } else {
+                await waitFor(() => events.warns.some(message => /CreateSubscription failed/.test(message)));
+            }
+            events.input('stop');
+            await waitFor(() => events.statuses[events.statuses.length - 1] === 'stopped');
+            events.input('start');
+            await delay(700);
+            assert.strictEqual(creates, 1, 'Restarting must not allocate another possibly-live pull-point');
+            events.input('stop');
+            await waitFor(() => events.statuses[events.statuses.length - 1] === 'stopped');
+            shift(121000);
+            events.input('start');
+            await waitFor(() => events.ops().includes('PullMessages'));
+            assert.strictEqual(creates, 2, 'Creation should recover after the uncertain subscription expires');
+        } finally { if (release) release(); await events.close(); }
+    })]);
+}
+
+tests.push(['failed subscription unsubscribe retains the pull-point across restart', async () => {
+    let unsubscribes = 0;
+    const events = await eventFixture({ script: { Unsubscribe: () => {
+        if (++unsubscribes === 1) return '<s:Fault><s:Reason>temporarily busy</s:Reason></s:Fault>';
+        return ONVIF_DEFAULTS.Unsubscribe;
+    } } });
+    try {
+        events.input('start');
+        await waitFor(() => events.ops().includes('PullMessages'));
+        events.input('stop');
+        await waitFor(() => events.statuses[events.statuses.length - 1] === 'stopped');
+        events.input('start');
+        await waitFor(() => events.ops().filter(op => op === 'PullMessages').length === 2);
+        assert.strictEqual(events.ops().filter(op => op === 'CreatePullPointSubscription').length, 1);
+        assert(events.ops().includes('Renew'));
+    } finally { await events.close(); }
+}]);
+
+tests.push(['backward wall-clock jump does not stretch the minimum pull interval', async () => withWallClock(async shift => {
+    let pulls = 0;
+    const events = await eventFixture({ script: { PullMessages: () => {
+        if (++pulls === 1) shift(-3600000);
+        return pulls < 3 ? '<PullMessagesResponse/>' : HOLD;
+    } } });
+    try {
+        events.input('start');
+        await waitFor(() => pulls >= 2, 4000);
+    } finally { await events.close(); }
+})]);
 
 tests.push(['throwing cancellation listeners do not block delivery or queue progress', async () => {
     const { client, ip } = fixture();
@@ -516,8 +861,10 @@ tests.push(['expiry during authentication survives a backward clock jump', async
 
 (async () => {
     let failures = 0;
+    const selected = tests.filter(([name]) => name.includes(process.env.TEST_FILTER || ''));
+    assert(selected.length > 0, 'No tests matched TEST_FILTER');
     try {
-        for (const [name, test] of tests) {
+        for (const [name, test] of selected) {
             try {
                 await test();
                 console.log('PASS ' + name);
@@ -530,6 +877,6 @@ tests.push(['expiry during authentication survives a backward clock jump', async
         https.request = originalRequest;
         delete require.cache[clientPath];
     }
-    console.log(`${tests.length - failures} passed, ${failures} failed`);
+    console.log(`${selected.length - failures} passed, ${failures} failed`);
     process.exitCode = failures ? 1 : 0;
 })().catch(error => { console.error(error); process.exitCode = 1; });

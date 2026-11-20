@@ -26,6 +26,16 @@
 
 const { registerOnvifCallbacks, unregisterOnvifCallbacks, executeOnDevice, acquireLease, noteDeviceReachable, COMMANDS } = require('../lib/tapo-client');
 const { soapEnvelope, soapPost, dropRoute, xmlFindAll, xmlInner, xmlText, xmlAttr } = require('../lib/onvif-soap');
+const { performance } = require('perf_hooks');
+
+// Relative timing must survive wall-clock adjustments; event timestamps keep using Date.
+const monotonicNow = () => performance.now();
+
+// Lifetime granted by the camera, as a duration so clock offsets don't matter; capped at what we asked for.
+function terminationTtlMs(xml, requestedSecs) {
+    const granted = Date.parse(xmlText(xml, 'TerminationTime')) - Date.parse(xmlText(xml, 'CurrentTime'));
+    return (granted > 0 ? Math.min(granted / 1000, requestedSecs) : requestedSecs) * 1000;
+}
 
 // ── ONVIF operations ──────────────────────────────────────────────────────────
 async function opGetCapabilities(deviceUrl, user, pass, _onReq = null) {
@@ -61,7 +71,7 @@ async function opCreateSubscription(eventUrl, user, pass, ttlSecs = 60, _onReq =
     const subRef = xmlInner(xml, 'SubscriptionReference');
     const addr   = xmlText(subRef || xml, 'Address') || xmlText(xml, 'Address');
     if (!addr) throw new Error('No subscription Address in response:\n' + xml.slice(0, 400));
-    return addr;
+    return { addr, ttlMs: terminationTtlMs(xml, ttlSecs) };
 }
 
 // pullTimeoutSec: how long the camera holds the request open if no events.
@@ -91,12 +101,17 @@ async function opRenew(subUrl, user, pass, ttlSecs = 60, _onReq = null) {
     );
 }
 
-async function opUnsubscribe(subUrl, user, pass) {
-    return soapPost(
+async function opUnsubscribe(subUrl, user, pass, _onReq = null) {
+    const xml = await soapPost(
         subUrl,
         soapEnvelope('<wsnt:Unsubscribe/>', user, pass),
         5000,
+        _onReq,
     );
+    if (/[Ff]ault/.test(xml) || !xmlFindAll(xml, 'UnsubscribeResponse').length) {
+        throw new Error('Unsubscribe not confirmed: ' + xml.slice(0, 400));
+    }
+    return xml;
 }
 
 // ── Parse NotificationMessage elements from PullMessages response ─────────────
@@ -169,12 +184,15 @@ module.exports = function (RED) {
         // Each running poll loop owns a context object.  doStop() marks it
         // stopped, so a loop still awaiting a slow request can never resume
         // after a quick stop→start (which previously left two loops running).
-        //   ctx = { stopped, req, isPull, interrupted, subUrl, wake }
+        //   ctx = { stopped, req, interrupted, handoffLease, wake }
         let loop            = null;    // context of the current poll loop (null = idle)
         let stopping        = null;    // Promise while doStop() cleanup runs
+        let cleanupCtx      = null;    // context whose stop cleanup (Unsubscribe) is running
         let intent          = 0;       // bumped on every start/stop request; orders deferred starts
         let closed          = false;   // node has been closed/removed
         let eventUrl        = null;    // discovered event service XAddr (stable per camera)
+        let sub             = null;    // { url, expiresAt } the one live pull-point this node may own; reused across loops
+        let uncertainSubUntil = 0;
         let ptzHolds        = 0;       // >0 while a PTZ command needs the connection slot
         let ptzWaiters      = [];      // loops paused until PTZ releases the slot
 
@@ -185,21 +203,34 @@ module.exports = function (RED) {
         const PTZ_GRACE_MS         = 3000;   // keep the slot free briefly: a Stop usually follows a move
         const PTZ_HOLD_MAX_MS      = 30000;  // safety: never pause polling forever
         const HANDOFF_MAX_MS       = 5000;   // HTTPS commands wait at most this long for ONVIF to connect
-        let   handoffLease         = null;   // held until the next ONVIF request has connected
+        const PRIVACY_RECHECK_MS   = 5 * 60 * 1000;  // privacy can change outside this plugin
 
-        // Close idle HTTPS sockets and keep HTTPS commands queued until the next ONVIF
-        // request has actually connected (track() releases it), so the two don't overlap.
-        async function handoff() {
-            const lease = await acquireLease(ip, { dropSessions: true, holdMs: HANDOFF_MAX_MS });
-            if (!lease) { node.warn('HTTPS queue busy — ONVIF continuing without hand-off'); return; }
-            if (handoffLease) handoffLease.release();
-            handoffLease = lease;
+        const ctxAlive = c => !c.stopped && !closed;
+        const subExpired = () => !!sub && monotonicNow() >= sub.expiresAt;
+        function dropSub() { if (sub) dropRoute(sub.url); sub = null; }
+
+        function releaseHandoff(ctx) {
+            const lease = ctx.handoffLease;
+            ctx.handoffLease = null;
+            if (lease) lease.release();
         }
 
-        function releaseOnConnect(req) {
-            const lease = handoffLease;
+        // Close idle HTTPS sockets and keep HTTPS commands queued until the next ONVIF request connects.
+        // 'ready' = lease held by ctx; 'busy' = HTTPS queue unavailable; 'cancelled' = no longer wanted.
+        async function handoff(ctx) {
+            const wanted = () => ctxAlive(ctx) && ptzHolds === 0;
+            const lease = await acquireLease(ip, { dropSessions: true, holdMs: HANDOFF_MAX_MS, stillWanted: wanted });
+            if (!lease) return wanted() ? 'busy' : 'cancelled';
+            if (!wanted()) { lease.release(); return 'cancelled'; }
+            releaseHandoff(ctx);
+            ctx.handoffLease = lease;
+            return 'ready';
+        }
+
+        function releaseOnConnect(ctx, req) {
+            const lease = ctx.handoffLease;
             if (!lease) return;
-            handoffLease = null;
+            ctx.handoffLease = null;
             let offExpiry = null, socket = null, connectEvent = null, released = false;
             const release = () => {
                 if (released) return;
@@ -328,29 +359,70 @@ module.exports = function (RED) {
         }
 
         // ── Poll loop ─────────────────────────────────────────────────────────
-        // Runs until ctx.stopped.  Every failure path (GetCapabilities, subscribe,
-        // renew, pull, SOAP fault) shares ONE exponential back-off (5 s → 60 s),
-        // reset only after a successful PullMessages.  Previously a camera that
-        // accepted subscriptions but failed pulls was hit every 5 s with an HTTPS
-        // login + GetCapabilities + a NEW pull-point (old ones never released),
-        // which exhausts the C225's subscription table and crashes it.
+        // Runs until ctx.stopped.  Every failure path shares ONE exponential back-off
+        // (5 s → 60 s), reset only after a successful PullMessages.  A live subscription
+        // survives transient failures and is renewed instead of replaced, so the camera's
+        // pull-point table is not refilled.
+        async function queryPrivacy() {
+            try {
+                const lm = await executeOnDevice(ip, user, getPass(), COMMANDS['get-lens-mask']);
+                const v  = lm?.lens_mask?.lens_mask_info?.enabled;
+                if (v === 'on' || v === 'off') return { state: v };
+                return { state: 'unknown', err: new Error('unexpected lens-mask reply') };
+            } catch (err) {
+                return { state: 'unknown', err };
+            }
+        }
+
         async function pollLoop(ctx, privacyKnownOff) {
-            const alive = () => !ctx.stopped && !closed;
-            const track = req => { ctx.req = req; releaseOnConnect(req); };
+            const alive = () => ctxAlive(ctx);
+            const track = req => { ctx.req = req; releaseOnConnect(ctx, req); };
             let failures         = 0;
             let needPrivacyCheck = !privacyKnownOff;
+            let privacyCheckedAt = monotonicNow();
+            let needHandoff      = true;   // an HTTPS socket may have opened since the last ONVIF connection
+            let settle           = false;  // pause briefly after the HTTPS sockets were closed
             let renewAt          = 0;
 
-            async function failAndWait(what, err, lostCamera) {
+            const renewDelayMs = ttlMs => Math.min(RENEW_EVERY_MS, Math.max(5000, ttlMs - (pullTimeoutSec + 45) * 1000));
+
+            async function backoff(what, err, label = 'offline') {
                 failures++;
-                if (ctx.subUrl) dropRoute(ctx.subUrl);
-                ctx.subUrl = null;
-                if (lostCamera) { eventUrl = null; needPrivacyCheck = true; }
-                const ms    = Math.min(5000 * 2 ** Math.min(failures - 1, 4), 60000);
-                const label = `${ms / 1000}s`;
-                node.warn(`${what} failed — retry in ${label}: ${err.message}`);
-                node.status({ fill: 'yellow', shape: 'ring', text: `offline — retry in ${label}` });
+                const ms = Math.min(5000 * 2 ** Math.min(failures - 1, 4), 60000);
+                node.warn(`${what} failed — retry in ${ms / 1000}s: ${err.message}`);
+                node.status({ fill: 'yellow', shape: 'ring', text: `${label} — retry in ${ms / 1000}s` });
                 await sleep(ctx, ms);
+            }
+
+            // subInvalid: the camera said the subscription is gone; otherwise it is kept for reuse until it expires.
+            async function failAndWait(what, err, lostCamera, subInvalid = false) {
+                if (subInvalid || subExpired()) dropSub();
+                else renewAt = 0;
+                if (lostCamera) { eventUrl = null; needPrivacyCheck = true; }
+                needHandoff = true;
+                await backoff(what, err);
+            }
+
+            // True when an ONVIF connection may open now; event traffic is never sent without coordination.
+            async function coordinated() {
+                if (needHandoff) {
+                    const h = await handoff(ctx);
+                    if (h === 'busy') { await backoff('Hand-off', new Error('HTTPS queue busy'), 'waiting'); return false; }
+                    if (h !== 'ready') return false;
+                    needHandoff = false;
+                    if (settle) { settle = false; await sleep(ctx, 300); }
+                }
+                if (!alive() || ptzHolds > 0) { releaseHandoff(ctx); needHandoff = true; return false; }
+                return true;
+            }
+
+            // The hold check and request creation are synchronous, so a PTZ pause cannot slip in between.
+            async function call(op) {
+                if (!alive() || ptzHolds > 0) { releaseHandoff(ctx); needHandoff = true; return { paused: true }; }
+                ctx.interrupted = false;
+                try { return { value: await op() }; }
+                catch (err) { return { err, paused: ctx.interrupted }; }
+                finally { ctx.req = null; }
             }
 
             node.status({ fill: 'blue', shape: 'dot', text: 'connecting…' });
@@ -358,124 +430,125 @@ module.exports = function (RED) {
             while (alive()) {
                 // A PTZ command owns the connection slot — wait until it is done.
                 if (ptzHolds > 0) { await waitForPtz(ctx); continue; }
+                const uncertainWait = uncertainSubUntil - monotonicNow();
+                if (!sub && uncertainWait > 0) {
+                    node.status({ fill: 'yellow', shape: 'ring', text: 'waiting for uncertain subscription expiry' });
+                    await sleep(ctx, uncertainWait);
+                    continue;
+                }
 
                 // Step 1: GetCapabilities — cached across reconnects; also acts as
                 // a liveness probe after a connection loss (reset to null there).
                 if (!eventUrl) {
-                    try {
-                        eventUrl = await opGetCapabilities(deviceUrl, user, getPass(), track);
-                    } catch (err) {
-                        ctx.req = null;
-                        if (!alive()) break;
-                        await failAndWait('GetCapabilities', err, true);
-                        continue;
-                    }
-                    ctx.req = null;
+                    if (!(await coordinated())) continue;
+                    const r = await call(() => opGetCapabilities(deviceUrl, user, getPass(), track));
                     if (!alive()) break;
+                    if (r.paused) continue;
+                    if (r.err) { await failAndWait('GetCapabilities', r.err, true); continue; }
+                    eventUrl = r.value;
                     noteDeviceReachable(ip);
                 }
 
-                // Step 2: privacy guard — once per (re)connect, only after the camera
-                // has proven reachable (so the check isn't wasted on an offline camera
-                // and a camera that comes back in privacy mode is always caught).
-                // A PullMessages long-poll against a C225 in privacy mode causes
-                // gradual firmware resource exhaustion and an eventual crash.
-                if (needPrivacyCheck) {
-                    needPrivacyCheck = false;
-                    let privacyOn = false;
-                    try {
-                        const lm  = await executeOnDevice(ip, user, getPass(), COMMANDS['get-lens-mask']);
-                        privacyOn = lm?.lens_mask?.lens_mask_info?.enabled === 'on';
-                    } catch (_) {
-                        // HTTPS API unavailable — privacy state unknown, proceed.
-                    }
-                    // Free the HTTPS keep-alive socket before the ONVIF calls.
-                    await handoff();
+                // Step 2: privacy guard — after every (re)connect and periodically, once the camera
+                // has answered ONVIF.  Unknown is not "off": a PullMessages long-poll against a C225
+                // in privacy mode causes firmware resource exhaustion and an eventual crash.
+                if (needPrivacyCheck || monotonicNow() - privacyCheckedAt >= PRIVACY_RECHECK_MS) {
+                    const { state, err } = await queryPrivacy();
                     if (!alive()) break;
-                    if (privacyOn) {
+                    needHandoff = true;
+                    settle      = true;
+                    if (state === 'on') {
                         // Stay idle; privacy-off via tapo-local restarts us through the registry.
-                        node.status({ fill: 'grey', shape: 'ring', text: 'privacy — idle' });
-                        ctx.stopped = true;
-                        if (loop === ctx) loop = null;
+                        await doStop(true);
+                        if (!closed) node.status({ fill: 'grey', shape: 'ring', text: 'privacy — idle' });
                         break;
                     }
-                    await sleep(ctx, 300);  // let the camera release the HTTPS slot
-                    continue;
+                    if (state === 'off') {
+                        needPrivacyCheck = false;
+                        privacyCheckedAt = monotonicNow();
+                    } else {
+                        needPrivacyCheck = true;
+                        await backoff('Privacy check', err, 'privacy unknown');
+                        continue;
+                    }
                 }
 
                 // Step 3: create the pull-point subscription, or renew it inline.
                 // Renewing between pulls (not from a timer) guarantees we never hold
                 // two connections to the camera at once.
-                if (!ctx.subUrl) {
-                    try {
-                        ctx.subUrl = await opCreateSubscription(eventUrl, user, getPass(), SUB_TTL_SECS, track);
-                    } catch (err) {
-                        ctx.req = null;
-                        if (!alive()) break;
-                        await failAndWait('CreateSubscription', err, !/fault/i.test(err.message));
-                        continue;
+                if (subExpired()) dropSub();
+                if (ptzHolds > 0) continue;
+                if (!(await coordinated())) continue;
+
+                if (!sub) {
+                    let attempted = false;
+                    const r = await call(() => {
+                        attempted = true;
+                        return opCreateSubscription(eventUrl, user, getPass(), SUB_TTL_SECS, track);
+                    });
+                    if (r.value) {
+                        uncertainSubUntil = 0;
+                        sub     = { url: r.value.addr, expiresAt: monotonicNow() + r.value.ttlMs };
+                        renewAt = monotonicNow() + renewDelayMs(r.value.ttlMs);
+                    } else if (attempted) {
+                        uncertainSubUntil = monotonicNow() + SUB_TTL_SECS * 1000;
                     }
-                    ctx.req = null;
-                    renewAt = Date.now() + RENEW_EVERY_MS;
                     if (!alive()) break;
+                    if (r.paused) continue;
+                    if (r.err) { await failAndWait('CreateSubscription', r.err, !/fault/i.test(r.err.message)); continue; }
                     node.status({ fill: 'green', shape: 'dot', text: 'listening' });
-                } else if (Date.now() >= renewAt) {
-                    try {
-                        const xml = await opRenew(ctx.subUrl, user, getPass(), SUB_TTL_SECS, track);
-                        if (/[Ff]ault/.test(xml)) throw new Error('Renew SOAP fault: ' + xml.slice(0, 300));
-                    } catch (err) {
-                        ctx.req = null;
-                        if (!alive()) break;
-                        await failAndWait('Renew', err, !/fault/i.test(err.message));
-                        continue;
+                } else if (monotonicNow() >= renewAt) {
+                    const cur = sub;
+                    const r   = await call(() => opRenew(cur.url, user, getPass(), SUB_TTL_SECS, track));
+                    let err   = r.err;
+                    let fault = false;
+                    if (!err && !r.paused) {
+                        if (/[Ff]ault/.test(r.value)) {
+                            err   = new Error('Renew SOAP fault: ' + r.value.slice(0, 300));
+                            fault = true;
+                        } else {
+                            const ttlMs = terminationTtlMs(r.value, SUB_TTL_SECS);
+                            cur.expiresAt = monotonicNow() + ttlMs;
+                            renewAt       = monotonicNow() + renewDelayMs(ttlMs);
+                        }
                     }
-                    ctx.req = null;
-                    renewAt = Date.now() + RENEW_EVERY_MS;
                     if (!alive()) break;
+                    if (r.paused) continue;
+                    if (err) { await failAndWait('Renew', err, !/fault/i.test(err.message), fault); continue; }
                 }
 
                 // Step 4: pull messages (camera holds the connection ≤ pullTimeoutSec).
                 // ctx.req is tracked so doStop()/PTZ can TCP-RST it immediately.
-                if (ptzHolds > 0) continue;  // PTZ arrived during subscribe/renew — yield first
-                const pullStart = Date.now();
-                let xml;
-                ctx.isPull      = true;
-                ctx.interrupted = false;
-                try {
-                    xml = await opPullMessages(ctx.subUrl, user, getPass(), pullTimeoutSec, 100, track);
-                } catch (err) {
-                    if (!alive()) break;
-                    // PTZ interrupt — slot handed to PTZ; the loop pauses at the top.
-                    if (ctx.interrupted) continue;
-                    // Skip Unsubscribe: the camera is likely unreachable, and the
-                    // pull-point expires via its TTL anyway.
-                    await failAndWait('PullMessages', err, true);
-                    continue;
-                } finally {
-                    ctx.isPull = false;
-                    ctx.req    = null;
-                }
+                if (!sub) continue;
+                const cur       = sub;
+                const pullStart = monotonicNow();
+                const r = await call(() => opPullMessages(cur.url, user, getPass(), pullTimeoutSec, 100, track));
                 if (!alive()) break;
+                // PTZ interrupt — slot handed to PTZ; the loop pauses at the top.
+                if (r.paused) continue;
+                // A transport failure keeps the subscription: it may be fine and only expires via its TTL.
+                if (r.err) { await failAndWait('PullMessages', r.err, true); continue; }
 
                 // SOAP fault → subscription expired or invalid → re-subscribe (with back-off).
-                if (/[Ff]ault/.test(xml)) {
-                    await failAndWait('PullMessages', new Error('SOAP fault: ' + xml.slice(0, 200)), false);
+                if (/[Ff]ault/.test(r.value)) {
+                    await failAndWait('PullMessages', new Error('SOAP fault: ' + r.value.slice(0, 200)), false, true);
                     continue;
                 }
                 if (failures > 0) node.status({ fill: 'green', shape: 'dot', text: 'listening' });
                 failures = 0;
 
-                const events = parseEvents(xml);
+                const events = parseEvents(r.value);
                 for (const ev of events) {
                     if (!alive()) break;
                     processEvent(ev);
                 }
 
-                const elapsed = Date.now() - pullStart;
+                const elapsed = monotonicNow() - pullStart;
                 if (elapsed < PULL_MIN_INTERVAL_MS && alive()) await sleep(ctx, PULL_MIN_INTERVAL_MS - elapsed);
             }
 
             // Loop exited — nothing running, nothing consuming camera resources.
+            releaseHandoff(ctx);
         }
 
         // ── Public: start ─────────────────────────────────────────────────────
@@ -488,7 +561,7 @@ module.exports = function (RED) {
                 stopping.then(() => { if (intent === myIntent) doStart(privacyKnownOff); });
                 return;
             }
-            const ctx = { stopped: false, req: null, isPull: false, interrupted: false, subUrl: null, wake: null };
+            const ctx = { stopped: false, req: null, interrupted: false, handoffLease: null, wake: null };
             loop = ctx;
             pollLoop(ctx, privacyKnownOff)
                 .catch(err => node.error('Poll loop crashed unexpectedly: ' + err.message))
@@ -515,7 +588,7 @@ module.exports = function (RED) {
 
         async function stopCleanup(ctx, skipUnsubscribe) {
             if (ctx.wake) ctx.wake();  // abort any back-off sleep / PTZ wait
-
+            releaseHandoff(ctx);
             // When stopping due to privacy-on the camera's motion sensor is
             // disabled, so emit detected:false for any topic that was active.
             if (skipUnsubscribe) {
@@ -543,21 +616,22 @@ module.exports = function (RED) {
             // before the next connection (Unsubscribe or Tapo HTTPS).
             await delay(600);
 
-            const subUrl = ctx.subUrl;
-            ctx.subUrl   = null;
-
-            if (!skipUnsubscribe && subUrl) {
+            // Without a confirmed Unsubscribe the subscription stays recorded, so the next loop
+            // renews it instead of creating another one; it is forgotten once its TTL has passed.
+            const cur = sub;
+            if (!skipUnsubscribe && cur && ptzHolds === 0 && !subExpired()) {
+                cleanupCtx = ctx;
                 try {
-                    await opUnsubscribe(subUrl, user, getPass());
+                    await opUnsubscribe(cur.url, user, getPass(), req => { ctx.req = req; });
+                    if (sub === cur) dropSub();
                 } catch (e) {
                     node.warn('Unsubscribe failed (ignored): ' + e.message);
+                } finally {
+                    cleanupCtx = null;
+                    ctx.req    = null;
                 }
             }
-            // Release the cached SOAP route for this subscription URL.  Each
-            // CreatePullPointSubscription mints a new URL, so without this the
-            // route cache would grow by one entry every stop/start (privacy
-            // toggle, camera reboot, PullMessages error, node-red restart …).
-            if (subUrl) dropRoute(subUrl);
+            if (subExpired()) dropSub();
             if (!closed) node.status({ fill: 'grey', shape: 'ring', text: 'stopped' });
         }
 
@@ -569,8 +643,9 @@ module.exports = function (RED) {
             // the Tapo HTTPS command and freeze the C225 (one-connection limit).
             stop:  () => doStop(true),
             start: (privacyKnownOff) => doStart(!!privacyKnownOff),
-            // PTZ coordination: pause the poll loop and abort an in-flight
-            // PullMessages so the connection slot is free for the PTZ command.
+            // PTZ coordination: pause the poll loop and abort whatever ONVIF request is in
+            // flight (discovery, subscribe, renew, pull, Unsubscribe) so the connection slot
+            // is free for the PTZ command.
             // Returns release(); polling resumes PTZ_GRACE_MS after the last release.
             interrupt: async () => {
                 ptzHolds++;
@@ -582,14 +657,16 @@ module.exports = function (RED) {
                     clearTimeout(safety);
                     setTimeout(() => { if (--ptzHolds === 0) flushPtzWaiters(); }, PTZ_GRACE_MS);
                 }
-                const ctx = loop;
-                if (ctx && ctx.isPull && ctx.req) {
-                    ctx.interrupted = true;
-                    ctx.req.destroy(new Error('ptz-interrupt'));
-                    ctx.req = null;
-                    // Brief pause — let the camera process the TCP RST before PTZ connects.
-                    await delay(200);
+                let cancelled = false;
+                for (const c of [loop, cleanupCtx]) {
+                    if (!c || !c.req) continue;
+                    c.interrupted = true;
+                    c.req.destroy(new Error('ptz-interrupt'));
+                    c.req = null;
+                    cancelled = true;
                 }
+                // Brief pause — let the camera process the TCP RST before PTZ connects.
+                if (cancelled) await delay(200);
                 return release;
             },
         };
@@ -613,7 +690,6 @@ module.exports = function (RED) {
         node.on('close', (removed, done) => {
             if (typeof removed === 'function') { done = removed; }  // Node-RED < 0.19
             closed = true;
-            if (handoffLease) { handoffLease.release(); handoffLease = null; }
             unregisterOnvifCallbacks(ip, callbacks);
             flushPtzWaiters();
             doStop(false).finally(() => {
@@ -623,6 +699,7 @@ module.exports = function (RED) {
                 // old entries costs nothing and keeps the cache clean.
                 dropRoute(deviceUrl);
                 if (eventUrl) dropRoute(eventUrl);
+                dropSub();
                 done();
             });
         });
@@ -649,23 +726,15 @@ module.exports = function (RED) {
                 startupTimer = setTimeout(() => rej(new Error('startup check timeout')), 15000);
             });
             Promise.race([checkDone, checkTimeout])
-                .then(async r => {
-                    // Free the HTTPS keep-alive socket before ONVIF opens its connection.
-                    await handoff();
+                .then(r => r?.lens_mask?.lens_mask_info?.enabled, () => undefined)
+                .then(privacy => {
                     if (closed || intent !== startupIntent) return;  // user/registry already decided
-                    const privacyOn = r?.lens_mask?.lens_mask_info?.enabled === 'on';
-                    if (privacyOn) {
+                    if (privacy === 'on') {
                         node.status({ fill: 'grey', shape: 'ring', text: 'privacy — idle' });
                     } else {
-                        doStart(true);
+                        // Unknown privacy state: the poll loop re-checks it (fail closed) with back-off.
+                        doStart(privacy === 'off');
                     }
-                })
-                .catch(async () => {
-                    await handoff();
-                    if (closed || intent !== startupIntent) return;
-                    // Privacy state unknown — the poll loop re-checks it once the
-                    // camera answers ONVIF, with exponential back-off (5 → 60 s cap).
-                    doStart(false);
                 })
                 .finally(() => {
                     // Clear the losing arm of the race so its setTimeout does not stay

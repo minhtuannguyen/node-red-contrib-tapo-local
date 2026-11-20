@@ -24,6 +24,9 @@
 
 const { soapPost, soapEnvelope, xmlText, xmlFindAll, xmlAttr, xmlInner, escXml } = require('../lib/onvif-soap');
 const { interruptOnvifForPtz, acquireLease } = require('../lib/tapo-client');
+const { performance } = require('perf_hooks');
+
+const monotonicNow = () => performance.now();
 
 // ── Per-camera PTZ coordination (shared by all tapo-ptz nodes) ───────────────
 // One HomeKit button = one tapo-ptz node, so serialization must be per IP,
@@ -44,8 +47,8 @@ function ptzDevice(ip) {
 }
 
 function assertPtzAvailable(ip, d) {
-    if (Date.now() < d.blockedUntil) {
-        const secs = Math.ceil((d.blockedUntil - Date.now()) / 1000);
+    if (monotonicNow() < d.blockedUntil) {
+        const secs = Math.ceil((d.blockedUntil - monotonicNow()) / 1000);
         throw new Error(`Camera ${ip} unreachable — PTZ not sent, retry in ${secs}s`);
     }
 }
@@ -75,7 +78,7 @@ function enqueuePtz(ip, action, run) {
         } catch (err) {
             if (NET_ERR_RE.test(err.message)) {
                 d.failures++;
-                d.blockedUntil = Date.now() + Math.min(PTZ_BACKOFF_MIN * 2 ** Math.min(d.failures - 1, 10), PTZ_BACKOFF_MAX);
+                d.blockedUntil = monotonicNow() + Math.min(PTZ_BACKOFF_MIN * 2 ** Math.min(d.failures - 1, 10), PTZ_BACKOFF_MAX);
             }
             throw err;
         }
@@ -109,11 +112,13 @@ module.exports = function (RED) {
         // PTZ service URL is discovered once from GetCapabilities then cached.
         const profileToken = escXml(config.profileToken || 'MediaProfile000');
         let ptzUrl         = null;   // PTZ service XAddr from GetCapabilities
+        let closed         = false;
 
         // Aborts the in-flight SOAP request once the lease has expired, so PTZ never overlaps HTTPS work.
         let ptzReq = null, leaseExpired = false;
         const trackReq = req => {
-            if (leaseExpired) req.destroy(new Error('PTZ lease expired'));
+            if (closed) req.destroy(new Error('PTZ node closed'));
+            else if (leaseExpired) req.destroy(new Error('PTZ lease expired'));
             else ptzReq = req;
         };
 
@@ -138,11 +143,11 @@ module.exports = function (RED) {
 
         // ── PTZ command execution ─────────────────────────────────────────────
         async function execPtz(action, pan, tilt, preset) {
+            if (closed) throw new Error('PTZ node closed');
             // Exclusive hold on the camera's HTTPS queue, so no HTTPS login/command overlaps this PTZ call.
             // A Stop is never withheld: without the lease or the ONVIF pause it is still sent.
             const mustSend = action === 'stop';
-            const lease = await acquireLease(ip, { waitMs: mustSend ? 1500 : 5000 });
-            if (!lease && !mustSend) throw new Error(`Camera ${ip} control busy \u2014 PTZ not sent`);
+            const lease = await acquireLease(ip, { waitMs: mustSend ? 1500 : 5000, stillWanted: () => !closed });
             let release = null;
             leaseExpired = false;
             ptzReq       = null;
@@ -151,6 +156,8 @@ module.exports = function (RED) {
                 if (ptzReq) ptzReq.destroy(new Error('PTZ lease expired'));
             });
             try {
+                if (closed) throw new Error('PTZ node closed');
+                if (!lease && !mustSend) throw new Error(`Camera ${ip} control busy \u2014 PTZ not sent`);
                 // Pause tapo-onvif-events (aborting its in-flight PullMessages) so the
                 // camera's connection slot is free for PTZ; resume when done.
                 try {
@@ -158,8 +165,10 @@ module.exports = function (RED) {
                 } catch (err) {
                     if (!mustSend) throw err;
                 }
+                if (closed) throw new Error('PTZ node closed');
                 return await execPtzCommand(action, pan, tilt, preset);
             } finally {
+                ptzReq = null;
                 if (offExpiry) offExpiry();
                 if (release) release();
                 if (lease) lease.release();
@@ -248,6 +257,7 @@ module.exports = function (RED) {
 
         // ── Input handler ─────────────────────────────────────────────────────
         node.on('input', async (msg, send, done) => {
+            if (closed) { done(new Error('PTZ node closed')); return; }
             const action = msg.action  !== undefined ? msg.action  : (config.action || 'continuousMove');
             const pan    = speed(msg.pan  !== undefined ? msg.pan  : (config.pan  || 0));
             const tilt   = speed(msg.tilt !== undefined ? msg.tilt : (config.tilt || 0));
@@ -266,6 +276,7 @@ module.exports = function (RED) {
             node.status({ fill: 'blue', shape: 'dot', text: action });
             try {
                 const result = await enqueuePtz(ip, action, () => execPtz(action, pan, tilt, preset));
+                if (closed) { done(); return; }
                 if (result && result.superseded) {
                     node.status({ fill: 'grey', shape: 'dot', text: `${action} (superseded)` });
                     done();
@@ -278,12 +289,14 @@ module.exports = function (RED) {
             } catch (err) {
                 // Wrong endpoint (e.g. 404) — rediscover on the next command.
                 if (/ONVIF HTTP/.test(err.message)) ptzUrl = null;
-                node.status({ fill: 'red', shape: 'ring', text: err.message.slice(0, 50) });
+                if (!closed) node.status({ fill: 'red', shape: 'ring', text: err.message.slice(0, 50) });
                 done(err);
             }
         });
 
         node.on('close', () => {
+            closed = true;
+            if (ptzReq) ptzReq.destroy(new Error('PTZ node closed'));
             ptzUrl = null;
         });
     }
