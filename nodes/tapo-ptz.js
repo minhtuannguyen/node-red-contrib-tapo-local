@@ -23,7 +23,7 @@
  */
 
 const { soapPost, soapEnvelope, xmlText, xmlFindAll, xmlAttr, xmlInner, escXml } = require('../lib/onvif-soap');
-const { interruptOnvifForPtz } = require('../lib/tapo-client');
+const { interruptOnvifForPtz, acquireLease } = require('../lib/tapo-client');
 
 // ── Per-camera PTZ coordination (shared by all tapo-ptz nodes) ───────────────
 // One HomeKit button = one tapo-ptz node, so serialization must be per IP,
@@ -130,13 +130,24 @@ module.exports = function (RED) {
 
         // ── PTZ command execution ─────────────────────────────────────────────
         async function execPtz(action, pan, tilt, preset) {
-            // Pause tapo-onvif-events (aborting its in-flight PullMessages) so the
-            // camera's connection slot is free for PTZ; resume when done.
-            const release = await interruptOnvifForPtz(ip);
+            // Exclusive hold on the camera's HTTPS queue, so no HTTPS login/command overlaps this PTZ call.
+            // A Stop is never withheld: without the lease or the ONVIF pause it is still sent.
+            const mustSend = action === 'stop';
+            const lease = await acquireLease(ip, { waitMs: mustSend ? 1500 : 5000 });
+            if (!lease && !mustSend) throw new Error(`Camera ${ip} control busy \u2014 PTZ not sent`);
+            let release = null;
             try {
+                // Pause tapo-onvif-events (aborting its in-flight PullMessages) so the
+                // camera's connection slot is free for PTZ; resume when done.
+                try {
+                    release = await interruptOnvifForPtz(ip);
+                } catch (err) {
+                    if (!mustSend) throw err;
+                }
                 return await execPtzCommand(action, pan, tilt, preset);
             } finally {
-                release();
+                if (release) release();
+                if (lease) lease.release();
             }
         }
 

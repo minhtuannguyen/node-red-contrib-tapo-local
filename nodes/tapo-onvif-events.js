@@ -24,7 +24,7 @@
  *   5. Unsubscribe on stop      → camera cleans up immediately
  */
 
-const { registerOnvifCallbacks, unregisterOnvifCallbacks, executeOnDevice, releaseSession, noteDeviceReachable, COMMANDS } = require('../lib/tapo-client');
+const { registerOnvifCallbacks, unregisterOnvifCallbacks, executeOnDevice, acquireLease, noteDeviceReachable, COMMANDS } = require('../lib/tapo-client');
 const { soapEnvelope, soapPost, dropRoute, xmlFindAll, xmlInner, xmlText, xmlAttr } = require('../lib/onvif-soap');
 
 // ── ONVIF operations ──────────────────────────────────────────────────────────
@@ -184,6 +184,15 @@ module.exports = function (RED) {
         const PULL_MIN_INTERVAL_MS = 1000;   // never spin if the camera answers PullMessages instantly
         const PTZ_GRACE_MS         = 3000;   // keep the slot free briefly: a Stop usually follows a move
         const PTZ_HOLD_MAX_MS      = 30000;  // safety: never pause polling forever
+        const HANDOFF_MS           = 1500;   // HTTPS commands wait this long while ONVIF connects
+
+        // Close idle HTTPS sockets and keep HTTPS commands queued briefly, so the next ONVIF
+        // request does not compete with an HTTPS login.
+        async function handoff() {
+            const lease = await acquireLease(ip, { dropSessions: true });
+            if (!lease) { node.warn('HTTPS queue busy — ONVIF continuing without hand-off'); return; }
+            setTimeout(lease.release, HANDOFF_MS);
+        }
 
         // Per-topic motion-detection state (reset on stop)
         let debounceTimers = {};
@@ -353,10 +362,9 @@ module.exports = function (RED) {
                         privacyOn = lm?.lens_mask?.lens_mask_info?.enabled === 'on';
                     } catch (_) {
                         // HTTPS API unavailable — privacy state unknown, proceed.
-                    } finally {
-                        // Free the HTTPS keep-alive socket before the ONVIF calls.
-                        releaseSession(ip, user);
                     }
+                    // Free the HTTPS keep-alive socket before the ONVIF calls.
+                    await handoff();
                     if (!alive()) break;
                     if (privacyOn) {
                         // Stay idle; privacy-off via tapo-local restarts us through the registry.
@@ -614,9 +622,9 @@ module.exports = function (RED) {
                 startupTimer = setTimeout(() => rej(new Error('startup check timeout')), 15000);
             });
             Promise.race([checkDone, checkTimeout])
-                .then(r => {
+                .then(async r => {
                     // Free the HTTPS keep-alive socket before ONVIF opens its connection.
-                    releaseSession(ip, user);
+                    await handoff();
                     if (closed || intent !== startupIntent) return;  // user/registry already decided
                     const privacyOn = r?.lens_mask?.lens_mask_info?.enabled === 'on';
                     if (privacyOn) {
@@ -625,8 +633,8 @@ module.exports = function (RED) {
                         doStart(true);
                     }
                 })
-                .catch(() => {
-                    releaseSession(ip, user);
+                .catch(async () => {
+                    await handoff();
                     if (closed || intent !== startupIntent) return;
                     // Privacy state unknown — the poll loop re-checks it once the
                     // camera answers ONVIF, with exponential back-off (5 → 60 s cap).

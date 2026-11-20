@@ -66,6 +66,11 @@ module.exports = function (RED) {
                     apiCmd,
                 );
                 msg.payload  = { command: commandKey, result };
+                if (result && result.superseded) {
+                    node.status({ fill: 'grey', shape: 'dot', text: `${commandKey} (superseded)` });
+                    done();
+                    return;
+                }
                 node.status({ fill: 'green', shape: 'dot', text: `✓ ${commandKey}` });
                 send(msg);
                 done();
